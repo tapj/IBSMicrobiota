@@ -1,0 +1,15 @@
+Package: IBSMicrobiota
+Title: What the package does (short line)
+Version: 0.2
+Authors@R: "First Last <first.last@example.com> [aut, cre]"
+Description: What the package does (paragraph)
+Depends: R (>= 3.0.2)
+License: GPL-3
+LazyData: true
+Suggests:
+    knitr,
+    ade4,
+    ggplot2,
+    vegan,
+    rmarkdown
+VignetteBuilder: knitr

@@ -1,0 +1,2674 @@
+---
+title: "IBS Microbiota analysis"
+author: "Julien Tap"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    fig_caption: true
+  pdf_document:
+    toc: true
+    fig_caption: true
+  word_document:
+    toc: true
+    fig_caption: true
+vignette: >
+  %\VignetteIndexEntry{IBSMicrobiota_analysis}
+  %\VignetteEngine{knitr::rmarkdown}
+  \usepackage[utf8]{inputenc}
+---
+ 
+
+ 
+
+```{r global_options, include=FALSE}
+library(knitr)
+opts_chunk$set(fig.width=12, fig.height=8, warning=FALSE, message=FALSE, 
+echo=FALSE, dev=c("png", "pdf"), fig.cap=TRUE, cache=TRUE)
+
+```
+
+
+### Introduction
+
+Here is a report of analysis regarding IBS microbiota dataset.
+
+
+This report was made to be reproducible. 
+It is made using R and report was automatically generated using knitr.
+All source code will be packaged and then available on my __github__ space 
+for any people who wanted to reproduce the analysis and figures.
+Sequences reads denoizing, quality checking, OTU clustering was made using the 
+[LOTUS](http://psbweb05.psb.ugent.be/lotus/index.html) pipeline at 97% level of similarity.
+
+
+### Methods summary
+
+
+We proposed here classical numerical ecology (alpha and beta diversity) according health status.
+Unsupervised analysis helped to stratify microbiota samples into enterotypes.
+Dependance between health status and enterotypes was tested.
+Univariate testing was done at OTUs levels according severity and subtypes 
+to check/quantify whether there was a signal according health group. Multivariates analysis was done to check global pattern between stool and biopsies.
+Machine learning approaches was used here not to find a diagnostic tools but to reduce 
+the complexity of the dataset to reach the most interesting OTU (then called IBS OTUs signature). 
+The microbial IBS dignature was then challenged aga../inst clinical metadata.
+
+
+In order to achieve this, we used the [BiotypeR](https://github.com/tapj/biotyper) 
+available on __github__ and various others packages allowing plotting, parsing, parallelization and machine learning analysis.
+
+```{r load, comment=NA, include=FALSE}
+library(BiotypeR)
+library(ggplot2)
+library(reshape2)
+library(grid)
+library(gridExtra)
+library(RColorBrewer)
+library(DirichletMultinomial)
+library(lattice)
+library(xtable)
+library(parallel)
+library(vegan)
+library(gplots)
+library(scales)
+library(LiblineaR)
+library(ROCR)
+library(stringr)
+library(waffle)
+library(dplyr)
+library(danr)
+library(foreach)
+library(doMC)
+
+
+```
+
+```{r source, eval=FALSE}
+source("R/mclapply.hack.R")
+source("R/liblineartest.v0.09.r")
+```
+
+### Study design and clinical characteristics in IBS patients and healthy subjects.
+
+```{r load_data}
+
+#devtools::load_all()
+data(IBSData)
+
+
+metadata = IBSData$metadata
+idx.v4v5 = which( metadata$Visit=="V4" | metadata$Visit=="V5" )
+metadata = metadata[idx.v4v5,]
+
+metadata$IBS_subtypes[which(metadata$Health=="control" & is.na(metadata$IBS_subtypes))] = "Healthy"
+metadata$IBS_subtypes = as.factor(metadata$IBS_subtypes)
+levels(metadata$IBS_subtypes) = c("IBS-C","IBS-D","IBS-M","IBS-U","Healthy") 
+levels(metadata$IBS_subtypes) = c("IBS-C","IBS-D","IBS-M",NA,"Healthy") #remove IBS-U from IBS subtypes analysis
+
+metadata$Lactulose_clusters = as.character(metadata$Lactulose_clusters)
+metadata$Lactulose_clusters[which(is.na(metadata$Lactulose_clusters))] = "normal"
+metadata$Lactulose_clusters = as.factor(metadata$Lactulose_clusters)
+
+
+otu      = IBSData$otu[,rownames(metadata)]
+tax      = IBSData$tax
+
+
+```
+
+Here we propose to mention that that there are two cohorts:
+
+- **Exploratory set**: 100 IBS were described in Le Nevé et al  enriched it with healthy controls,
+and a second time point for IBS, and **paired mucosa** for some IBS / healthy 
+- **Validation set** (2nd batch): The  second cohort, in which fecal samples were collected later.
+
+Here is the global design of the study. This included V4 and V5 samples.
+
+
+```{r clinical_characteristics, fig.cap="Study design", fig.height=7, fig.width=13}
+
+metadata_baseline = metadata[which(metadata$Sample_type=="Stool" & metadata$Visit == "V4"),c(8,4,7,9,12,13,14, 17,22,23,24,25,26)]
+
+
+
+p_gender_basic = ggplot(melt(prop.table(table(metadata_baseline$Health, metadata_baseline$Gender),1)))
+p_gender_basic  = p_gender_basic  + geom_bar(aes(x=Var1, y=value, fill=as.character(Var2)), stat="identity",width=0.95) + scale_y_continuous(label = percent) 
+p_gender_basic  = p_gender_basic  + xlab("Health") + ylab("Gender proportion") + scale_fill_manual("Gender", values=c("red","blue"))
+p_gender_basic  = p_gender_basic  #+ guides(fill=FALSE)
+
+
+
+metadata_baseline[metadata_baseline$Health == "control", "IBS.Severity.Score"] <- NA #fix IBS-SSS in H control
+
+
+names(metadata_baseline)[names(metadata_baseline)=="HAD.DEPRES"]  = "HAD Depress."
+names(metadata_baseline)[names(metadata_baseline)=="HAD.ANXIETY"] = "HAD Anxiety"
+names(metadata_baseline)[names(metadata_baseline)=="BSF.Mean_Frequenc_StoolPerDay"] = "Average Stool per day"
+names(metadata_baseline)[names(metadata_baseline)=="BSF.Mean_Stoolform_total"] = "Average BSF Scale"
+names(metadata_baseline)[names(metadata_baseline)=="transit.days"] = "OATT (days)"
+names(metadata_baseline)[names(metadata_baseline)=="Age"] = "Age (Years)"
+names(metadata_baseline)[names(metadata_baseline)=="IBS.Severity.Score"] = "IBS-SSS"
+names(metadata_baseline)[names(metadata_baseline)=="study_group.x"] = "Study_group"
+names(metadata_baseline)[names(metadata_baseline)=="CH4"] = "CH4 (ppm)"
+names(metadata_baseline)[names(metadata_baseline)=="H2"] = "H2 (ppm)"
+
+metadata_baseline = melt(metadata_baseline[,-1], id.vars=c("Study_group","Health"))
+
+#basic statistical description for Table 1
+basic_desc = metadata_baseline %>% 
+                group_by(variable,Health, Study_group) %>% 
+                summarize(med=median(value, na.rm=T), q25=quantile(value,0.25, na.rm=T), q75=quantile(value,0.75, na.rm=T)) %>% 
+                collect()
+
+
+p_clinical_basic = ggplot(metadata_baseline, aes(x=Health, y=value, fill=Study_group  )  ) +
+geom_violin(position=position_dodge()) + 
+geom_boxplot(width=0.2, position=position_dodge(0.9), aes(fill=NULL, group=interaction(Health,Study_group))) +
+facet_wrap(~variable, nrow=2, scales="free_y" ) + ylab("") +  scale_fill_discrete("Study group")
+
+p_clinical_basic
+
+
+pdf("../inst/figures/Tap_FigureS1_basiccharacteristics.pdf", w=13, h=6)
+
+grid.arrange(p_clinical_basic + theme_bw() , p_gender_basic + theme_bw() + theme(legend.position=c(0.6,0.15)), widths=c(6,1.5), ncol=2)
+
+
+dev.off()
+
+
+Tap_FigureS1_basiccharacteristics_cowplot = 
+plot_grid(
+
+  p_clinical_basic + theme_bw()  ,
+  p_gender_basic   + theme_bw() + theme(legend.position=c(0.6,0.15)),
+  
+   labels=c("A","B"), rel_widths=c(6,1.5), ncol=2
+
+)
+
+
+
+
+pdf("../inst/figures/Tap_FigureS1_basiccharacteristics_cowplot.pdf", w=13, h=6)
+
+Tap_FigureS1_basiccharacteristics_cowplot 
+
+dev.off()
+
+
+
+
+basic_test_res = lapply(split(na.omit(metadata_baseline), na.omit(metadata_baseline)$variable),
+    function(df){
+        lapply(split(df, df$Health), function(d){
+           pairwise.wilcox.test(d$value,d$Study_group, conf.int= TRUE)
+       })
+    })
+    
+basic_test_res = sapply(basic_test_res, function(l) { lapply(l,function(x) x$p.value[1]) })
+    
+#p.value fdr explo vs validation study group by health status    
+basic_test_res = matrix(p.adjust( basic_test_res, method="fdr"),nc=dim(basic_test_res)[2], dimnames=dimnames(basic_test_res))
+
+
+#build Table S3
+metadata_baseline_severity = metadata[which(metadata$Sample_type=="Stool" & metadata$Visit == "V4"), c(7,18,21,4)]
+
+
+metadata_baseline_severity$IBS_subtypes[which(metadata_baseline_severity$Health=="control" & is.na(metadata_baseline_severity$IBS_subtypes))] = "Healthy"
+metadata_baseline_severity$IBS_subtypes = as.factor(metadata_baseline_severity$IBS_subtypes)
+levels(metadata_baseline_severity$IBS_subtypes) = c("IBS-C","IBS-D","IBS-M","IBS-U","Healthy") 
+levels(metadata_baseline_severity$IBS_subtypes) = c("IBS-C","IBS-D","IBS-M",NA,"Healthy") #remove IBS-U from IBS subtypes analysis
+
+metadata_baseline_severity_summary = 
+dcast(metadata_baseline_severity, SSgroup + IBS_subtypes ~ study_group.x)[-1,] %>% 
+na.omit 
+
+metadata_baseline_severity_summary = 
+data.frame(metadata_baseline_severity_summary[1:2], 
+v=paste0(metadata_baseline_severity_summary[,3]," (" ,metadata_baseline_severity_summary[,4],")")) %>%
+dcast(SSgroup~IBS_subtypes, value.var="v")
+
+
+
+
+write.csv2(metadata_baseline_severity_summary, file="inst/tables/TableS3_severity_subtypes_summary.csv")
+
+metadata_baseline_severity_summary
+
+
+
+```
+
+Regarding IBS subtypes distribution, no difference was observed between severe and other IBS patients. 
+No difference was observed between exploratory and validation set. 
+No difference was observed between subtypes distribution within IBS severe compared to random distribution.
+
+
+
+
+_______________________________________________________________________________________________
+
+```{r study.design.waffle.chart, fig.cap="Study design", fig.height=7, fig.width=12}
+
+idx.stool =  which(metadata$Sample_type=="Stool") 
+
+idx.stool.explo  = which(metadata$Sample_type=="Stool" & metadata$study_group.x=="exploratory") 
+idx.stool.valid  = which(metadata$Sample_type=="Stool" & metadata$study_group.x=="validation") 
+idx.biopsy.valid = which(metadata$Sample_type=="Biopsy" & metadata$study_group.x=="exploratory")
+
+p1_waffle = waffle(table(metadata$SSgroup[idx.stool.explo]), colors=rev(brewer.pal(n=4, name="BrBG")), rows= 8, pad = 1, xlab="1 square = 1 sample")
+p1_waffle = p1_waffle + theme(plot.title = element_text(size = rel(1))) 
+p1_waffle = p1_waffle + ggtitle("stool samples\nexploratory set") + scale_fill_manual("",labels=c("healthy","mild IBS","moderate IBS","severe IBS"), values=rev(brewer.pal(n=4, name="BrBG"))   ) 
+
+p2_waffle = waffle(table(metadata$SSgroup[idx.stool.valid]), colors=rev(brewer.pal(n=4, name="BrBG")), rows = 5, pad=1) 
+p2_waffle = p2_waffle + theme(plot.title = element_text(size = rel(1))) 
+p2_waffle = p2_waffle + ggtitle("stool samples\nvalidation set") + guides(fill=FALSE)
+
+
+p3_waffle = waffle(table(metadata$SSgroup[idx.biopsy.valid]), rows = 5)
+p3_waffle = p3_waffle + theme(plot.title = element_text(size = rel(1))) 
+p3_waffle = p3_waffle + guides(fill = FALSE) + scale_fill_manual(values=rev(brewer.pal(n=4, name="BrBG"))   ) 
+p3_waffle = p3_waffle + ggtitle("biopsy samples set")
+
+
+
+p4_waffle = waffle(table(metadata$IBS_subtypes[idx.stool.explo]),  rows= 8, pad = 1, xlab="1 square = 1 sample")
+p4_waffle = p4_waffle + theme(plot.title = element_text(size = rel(1))) 
+p4_waffle = p4_waffle + scale_fill_dan(labels=c("IBS-C","IBS-D","IBS-M","Healthy"))
+p4_waffle = p4_waffle + ggtitle("stool samples\nexploratory set") 
+
+p5_waffle = waffle(table(metadata$IBS_subtypes[idx.stool.valid]),  rows = 5, pad=1) 
+p5_waffle = p5_waffle + theme(plot.title = element_text(size = rel(1))) + scale_fill_dan()
+p5_waffle = p5_waffle + ggtitle("stool samples\nvalidation set") + guides(fill=FALSE)
+
+
+p6_waffle = waffle(table(metadata$IBS_subtypes[idx.biopsy.valid]), color=dan_pal()(4), rows = 5) #fix colors here
+p6_waffle = p6_waffle + theme(plot.title = element_text(size = rel(1))) 
+p6_waffle = p6_waffle + guides(fill = FALSE)
+p6_waffle = p6_waffle + ggtitle("biopsy samples set")
+
+
+
+grid.arrange(arrangeGrob(p1_waffle, arrangeGrob(p2_waffle,p3_waffle, ncol=2)),
+             arrangeGrob(p4_waffle, arrangeGrob(p5_waffle,p6_waffle, ncol=2)), ncol=2 )
+
+
+
+```
+
+**Figure 1: Number of sample per dataset** 
+This chart represent the number of samples as function of dataset and health status (Severity group and subtypes). each square represented one sample in this study. 
+
+____________________________________________________________________________________________________
+
+
+> TO DO: a table with minimal clinical parameters for each set.
+
+
+
+### Stool and biopsy microbial ecology of IBS patient and healthy control
+
+Here we propose the following analysis on stool and biopsy 
+between healthy and IBS patients stratified by severity and subtypes: 
+
+- Microbial OTUs richness comparison (alpha diversity)
+- Microbial distance analysis within group (beta diversity within)
+- Microbial distance analysis between IBS and Healthy (beta diversity between)
+
+Additionally, we added those following analysis:
+
+- Unsupervised enterotypes analysis
+- Covariation analysis between paired stool/biopsy
+
+> TO DO: ade4::apqe for each stratification, Quadratic Entropy
+
+#### Microbial OTUs richness comparison
+
+
+As expected, stool richness was significantly higher than biopsy. 
+OTUs richness was not different according health status in stool samples. Only mild IBS patient biopsies had a significant lower richness compared to others.
+
+____________________________________________________________________________________________________
+
+```{r richness.stool.biopsy, fig.cap="Stool and biopsy microbial richness", fig.height=10, fig.width=12}
+
+seq_min  = min(apply(otu,2,sum))
+richness = rarefy(t(otu), seq_min)
+metadata = data.frame(metadata, richness)
+
+patients_with_biopsy = metadata[which(metadata$Sample_type=="Biopsy"),"Patient_ID"]
+
+p2_richness = ggplot(metadata[metadata$Patient_ID %in% patients_with_biopsy, ], aes(y=richness, x=Sample_type)) + geom_boxplot(aes(fill=Sample_type))
+p2_richness = p2_richness + guides(fill=FALSE) + xlab("") + ylab("Number of OTUs") 
+
+
+
+df1 = metadata[!is.na(metadata$SSgroup),names(metadata) %in% c("Sample_type","Health","SSgroup","richness") ]
+df2 = metadata[!is.na(metadata$IBS_subtypes),names(metadata) %in% c("Sample_type","Health","IBS_subtypes","richness")]
+
+names(df1) = names(df2) = c("Sample_type","Health","Group","richness")
+
+df3 = data.frame(rbind(df1,df2), stratified=c(rep("severity",dim(df1)[1]),rep("subtypes",dim(df2)[1]))  )
+df3 = df3[-which(df3$Health=="control" & df3$Group=="control" ),] #remove healthy duplicate
+df3$Group = as.factor(as.character(df3$Group))
+
+df3$stratified = as.character(df3$stratified)
+
+df3$stratified[which(df3$Health=="control")] = "healthy"
+df3$stratified=factor(df3$stratified, levels=c("healthy","subtypes", "severity"))
+
+p6_richness_health = ggplot(df3) + geom_boxplot(aes(y=richness, x=stratified, fill=Group))
+p6_richness_health = p6_richness_health + facet_wrap(~Sample_type, nrow=1) + ylab("Microbial richness\n(Number of OTUs)") + xlab("Health status")
+p6_richness_health = p6_richness_health + scale_x_discrete(labels=c("Healthy", "IBS Patients\n(by subtypes)","IBS Patients\n(by SSS group)"))
+p6_richness_health = p6_richness_health + scale_fill_manual("", labels = c("Healthy","IBS-C","IBS-D","IBS-M","Mild IBS","Moderate IBS","Severe IBS"), 
+                                values = c(rev(brewer.pal(n=4, name="BrBG"))[1], dan_pal("dan1")(3),  rev(brewer.pal(n=4, name="BrBG"))[2:4]))
+
+
+grid.arrange(p6_richness_health,tableGrob(table(df3$Group , df3$Sample_type)))
+
+```
+
+**Figure 2: Stool and biopsy microbial richness as function of health status** 
+OTU microbiota richness evaluated at the same sequencing depth.
+
+____________________________________________________________________________________________________
+
+
+
+
+#### Microbial distance within and between group
+
+The JSD entropy based metric was used to do pairwise comparisons between each sample.
+
+
+```{r JSD_genus_based_matrix}
+
+tax_tmp     = paste(tax[,1],tax[,2],tax[,3],tax[,4], tax[,5],tax[,6], sep=".")
+genus       = apply(otu, 2, tapply, tax_tmp, sum)
+genus.prop  = prop.table(genus,2)
+genus.jsd   = dist.JSD(genus.prop)
+genus.jsd.m = as.matrix(genus.jsd)
+
+genus.jsd.metadata = data.frame(genus.jsd.m, metadata[,names(metadata) %in% c("Sample_type","Health","SSgroup","IBS_subtypes") ], samples=row.names(genus.jsd.m))
+
+#genus.jsd.melt = melt(genus.jsd.metadata, id.vars=c("Sample_type","Health","SSgroup","IBS_subtypes","samples"))
+
+
+groups=list(
+idx.biopsy.healthy  = which(metadata$Sample_type == "Biopsy" & metadata$SSgroup      == "control"),
+idx.biopsy.mild     = which(metadata$Sample_type == "Biopsy" & metadata$SSgroup      == "mild"),
+idx.biopsy.moderate = which(metadata$Sample_type == "Biopsy" & metadata$SSgroup      == "moderate"),
+idx.biopsy.severe   = which(metadata$Sample_type == "Biopsy" & metadata$SSgroup      == "severe"),
+idx.biopsy.ibs_c    = which(metadata$Sample_type == "Biopsy" & metadata$IBS_subtypes == "IBS-C"),
+idx.biopsy.ibs_d    = which(metadata$Sample_type == "Biopsy" & metadata$IBS_subtypes == "IBS-D"),
+idx.biopsy.ibs_m    = which(metadata$Sample_type == "Biopsy" & metadata$IBS_subtypes == "IBS-M"),
+
+
+idx.stool.healthy   = which(metadata$Sample_type == "Stool" & metadata$SSgroup      == "control"),
+idx.stool.mild      = which(metadata$Sample_type == "Stool" & metadata$SSgroup      == "mild"),
+idx.stool.moderate  = which(metadata$Sample_type == "Stool" & metadata$SSgroup      == "moderate"),
+idx.stool.severe    = which(metadata$Sample_type == "Stool" & metadata$SSgroup      == "severe"),
+idx.stool.ibs_c     = which(metadata$Sample_type == "Stool" & metadata$IBS_subtypes == "IBS-C"),
+idx.stool.ibs_d     = which(metadata$Sample_type == "Stool" & metadata$IBS_subtypes == "IBS-D"),
+idx.stool.ibs_m     = which(metadata$Sample_type == "Stool" & metadata$IBS_subtypes == "IBS-M")
+)
+
+#within
+
+within.groups = NULL
+
+for(i in names(groups)) {
+
+tmp = as.vector(as.dist(genus.jsd.m[groups[[i]],groups[[i]]]))
+
+tmp.group = rep(i, length(tmp))
+
+within.groups = rbind(within.groups ,data.frame(jsd = as.numeric(tmp), groups = tmp.group))
+
+
+}
+
+
+sample_type = t(sapply(strsplit(as.character(within.groups$groups), split="\\."), function(x) x))[,2]
+sample_type = as.factor(sample_type)
+levels(sample_type) = c("Biopsy","Stool")
+health_groups = as.factor(t(sapply(strsplit(as.character(within.groups$groups), split="\\."), function(x) x))[,3])
+stratified = health_groups
+
+levels(stratified) = c("Healthy",rep("Subtypes",3),rep("Severity",3))
+
+
+within.groups=cbind(within.groups, sample_type,  health_groups , stratified   )
+
+
+#between
+
+between.groups = NULL
+
+for(i in names(groups)) {
+
+  if (length(grep("biopsy", i)) > 0 ) {
+
+    tmp = as.vector(as.dist(genus.jsd.m[groups[["idx.biopsy.healthy"]],groups[[i]]]))
+    tmp.group = rep(i, length(tmp))
+    between.groups = rbind(between.groups ,data.frame(jsd = as.numeric(tmp), groups = tmp.group))
+
+  } else {
+  
+  
+    tmp = as.vector(as.dist(genus.jsd.m[groups[["idx.stool.healthy"]],groups[[i]]]))
+    tmp.group = rep(i, length(tmp))
+    between.groups = rbind(between.groups ,data.frame(jsd = as.numeric(tmp), groups = tmp.group))
+  
+  
+  }
+
+
+
+
+}
+
+
+
+sample_type = t(sapply(strsplit(as.character(between.groups$groups), split="\\."), function(x) x))[,2]
+sample_type = as.factor(sample_type)
+levels(sample_type) = c("Biopsy","Stool")
+health_groups = as.factor(t(sapply(strsplit(as.character(between.groups$groups), split="\\."), function(x) x))[,3])
+stratified = health_groups
+
+levels(stratified) = c("Healthy",rep("Subtypes",3),rep("Severity",3))
+
+
+between.groups=cbind(between.groups, sample_type,  health_groups , stratified   )
+
+```
+
+____________________________________________________________________________________________________
+
+
+```{r within_between_analysis, fig.cap="Within and Between analysis", fig.height=8, fig.width=12}
+
+
+p7_jsd_within = ggplot(within.groups) + geom_boxplot(aes(y=jsd, x=stratified, fill=health_groups)) + facet_wrap(~sample_type)
+p7_jsd_within  = p7_jsd_within  + ylab("Microbial distance\n(JSD)") + xlab("") + ylim(0,1)
+p7_jsd_within  = p7_jsd_within  + scale_x_discrete(labels=c("Within\nHealthy","Within\nIBS Patients\n(by subtypes)", "Within\nIBS Patients\n(by SSS group)"))
+p7_jsd_within  = p7_jsd_within  + scale_fill_manual("", labels = c("Healthy","IBS-C","IBS-D","IBS-M","Mild IBS","Moderate IBS","Severe IBS"), 
+                                values = c(rev(brewer.pal(n=4, name="BrBG"))[1], dan_pal("dan1")(3)  , rev(brewer.pal(n=4, name="BrBG"))[2:4]  ) )
+
+
+
+
+p8_jsd_between = ggplot(between.groups) + geom_boxplot(aes(y=jsd, x=stratified, fill=health_groups)) + facet_wrap(~sample_type)
+p8_jsd_between = p8_jsd_between + ylab("Microbial distance\n(JSD)") + xlab("")+ ylim(0,1)
+p8_jsd_between = p8_jsd_between + scale_x_discrete(labels=c("Within\nHealthy","Between Healthy\nand IBS Patients\n(by subtypes)", "Between Healthy \nand IBS Patients\n(by SSS group)"))
+p8_jsd_between = p8_jsd_between + scale_fill_manual("", labels = c("Healthy","IBS-C","IBS-D","IBS-M","Mild IBS","Moderate IBS","Severe IBS"), 
+                                values = c(rev(brewer.pal(n=4, name="BrBG"))[1], dan_pal("dan1")(3)  , rev(brewer.pal(n=4, name="BrBG"))[2:4]  ) )
+
+
+grid.arrange(p7_jsd_within,p8_jsd_between , nrow=2)
+
+
+```
+
+**Figure 3: Stool and biopsy microbial distance as function of health status** 
+Microbial distances between samples were evaluated using JSD metric.
+
+____________________________________________________________________________________________________
+
+
+Within beta-diversity was different only for mild IBS patient in biopsy. 
+Compared to healthy, no difference was observed.
+
+
+```{r}
+pdf("../inst/figures/Tap_FigureSupp_ecology.pdf", w=10, h=10)
+grid.arrange(p6_richness_health+theme_bw()+xlab(""),p7_jsd_within+theme_bw(),p8_jsd_between+theme_bw()+xlab("Health status"), nrow=3)
+dev.off()
+
+
+
+
+
+
+Tap_FigureSupp_ecology_cowplot = plot_grid(
+
+p6_richness_health + theme_bw()+xlab(""),
+p7_jsd_within      + theme_bw(),
+p8_jsd_between     + theme_bw()+xlab("Health status"), 
+
+
+labels=LETTERS[1:3], align="h", nrow=3)
+
+pdf("../inst/figures/Tap_FigureSupp_ecology_cowplot.pdf", w=10, h=10)
+
+Tap_FigureSupp_ecology_cowplot 
+
+dev.off()
+
+
+
+
+```
+
+
+
+The bray curtis based metric was used to do pairwise comparisons between each sample.
+
+
+```{r BC_genus_based_matrix}
+
+
+genus.bc   = ecodist::distance(t(genus.prop), method = "bray-curtis")
+genus.bc.m = as.matrix(genus.bc)
+
+genus.bc.metadata = data.frame(genus.bc.m, metadata[,names(metadata) %in% c("Sample_type","Health","SSgroup","IBS_subtypes") ], samples=row.names(genus.bc.m))
+
+#within
+
+within.groups.bc = NULL
+
+for(i in names(groups)) {
+
+tmp = as.vector(as.dist(genus.bc.m[groups[[i]],groups[[i]]]))
+
+tmp.group = rep(i, length(tmp))
+
+within.groups.bc = rbind(within.groups.bc ,data.frame(bc = as.numeric(tmp), groups = tmp.group))
+
+
+}
+
+
+sample_type = t(sapply(strsplit(as.character(within.groups.bc$groups), split="\\."), function(x) x))[,2]
+sample_type = as.factor(sample_type)
+levels(sample_type) = c("Biopsy","Stool")
+health_groups = as.factor(t(sapply(strsplit(as.character(within.groups.bc$groups), split="\\."), function(x) x))[,3])
+stratified = health_groups
+
+levels(stratified) = c("Healthy",rep("Subtypes",3),rep("Severity",3))
+
+
+within.groups.bc=cbind(within.groups.bc, sample_type,  health_groups , stratified   )
+
+
+#between
+
+between.groups.bc = NULL
+
+for(i in names(groups)) {
+
+  if (length(grep("biopsy", i)) > 0 ) {
+
+    tmp = as.vector(as.dist(genus.bc.m[groups[["idx.biopsy.healthy"]],groups[[i]]]))
+    tmp.group = rep(i, length(tmp))
+    between.groups.bc = rbind(between.groups.bc ,data.frame(bc = as.numeric(tmp), groups = tmp.group))
+
+  } else {
+  
+  
+    tmp = as.vector(as.dist(genus.bc.m[groups[["idx.stool.healthy"]],groups[[i]]]))
+    tmp.group = rep(i, length(tmp))
+    between.groups.bc = rbind(between.groups.bc ,data.frame(bc = as.numeric(tmp), groups = tmp.group))
+  
+  
+  }
+
+
+
+
+}
+
+
+
+sample_type = t(sapply(strsplit(as.character(between.groups.bc$groups), split="\\."), function(x) x))[,2]
+sample_type = as.factor(sample_type)
+levels(sample_type) = c("Biopsy","Stool")
+health_groups = as.factor(t(sapply(strsplit(as.character(between.groups.bc$groups), split="\\."), function(x) x))[,3])
+stratified = health_groups
+
+levels(stratified) = c("Healthy",rep("Subtypes",3),rep("Severity",3))
+
+
+between.groups.bc=cbind(between.groups.bc, sample_type,  health_groups , stratified   )
+
+
+
+
+```
+
+
+
+```{r within_between_analysis_bc, fig.cap="Within and Between analysis (bray_curtis)", fig.height=8, fig.width=12}
+
+
+p7_bc_within = ggplot(within.groups.bc) + geom_boxplot(aes(y=bc, x=stratified, fill=health_groups)) + facet_wrap(~sample_type)
+p7_bc_within  = p7_bc_within  + ylab("Microbial distance\n(Bray-Curtis)") + xlab("") + ylim(0,1)
+p7_bc_within  = p7_bc_within  + scale_x_discrete(labels=c("Within\nHealthy","Within\nIBS Patients\n(by subtypes)", "Within\nIBS Patients\n(by SSS group)"))
+p7_bc_within  = p7_bc_within  + scale_fill_manual("", labels = c("Healthy","IBS-C","IBS-D","IBS-M","Mild IBS","Moderate IBS","Severe IBS"), 
+                                values = c(rev(brewer.pal(n=4, name="BrBG"))[1], dan_pal("dan1")(3)  , rev(brewer.pal(n=4, name="BrBG"))[2:4]  ) )
+
+
+
+
+p8_bc_between = ggplot(between.groups) + geom_boxplot(aes(y=jsd, x=stratified, fill=health_groups)) + facet_wrap(~sample_type)
+p8_bc_between = p8_bc_between + ylab("Microbial distance\n(Bray-Curtis)") + xlab("")+ ylim(0,1)
+p8_bc_between = p8_bc_between + scale_x_discrete(labels=c("Within\nHealthy","Between Healthy\nand IBS Patients\n(by subtypes)", "Between Healthy \nand IBS Patients\n(by SSS group)"))
+p8_bc_between = p8_bc_between + scale_fill_manual("", labels = c("Healthy","IBS-C","IBS-D","IBS-M","Mild IBS","Moderate IBS","Severe IBS"), 
+                                values = c(rev(brewer.pal(n=4, name="BrBG"))[1], dan_pal("dan1")(3)  , rev(brewer.pal(n=4, name="BrBG"))[2:4]  ) )
+
+
+grid.arrange(p7_bc_within,p8_bc_between , nrow=2)
+
+
+
+
+
+Tap_FigureSupp_ecology_cowplot_v2 = plot_grid(
+
+p6_richness_health + theme_bw()+xlab(""),
+p7_jsd_within      + theme_bw(),
+p8_jsd_between     + theme_bw(), #+xlab("Health status"), 
+p7_bc_within       + theme_bw(),
+p8_bc_between      + theme_bw()+xlab("Health status"),
+
+labels=LETTERS[1:5], align="h", nrow=5)
+
+
+
+pdf("inst/figures/Tap_FigureSupp_ecology_cowplot_v2.pdf", w=10, h=16)
+
+Tap_FigureSupp_ecology_cowplot_v2
+
+dev.off()
+
+
+
+
+```
+
+**Figure 3 [updated]: Stool and biopsy microbial distance as function of health status** 
+Microbial distances between samples were evaluated using JSD and Bray-Curtis metric.
+
+____________________________________________________________________________________________________
+
+
+
+
+
+
+
+
+#### Enterotypes stratification
+
+Using the Dirichlet multinomial distribution, we tried to stratify the stool
+microbiota. Baysian inference helped to determined the optimal number of 
+Dirichlet component which correspond to the number of microbiota type
+in the dataset.
+
+```{r genus_integer_creation}
+tax_tmp = paste(tax[,1],tax[,2],tax[,3],tax[,4], tax[,5],tax[,6], sep=".")
+
+otu_stool_idx             = row.names(metadata[idx.stool,])
+otu_stool                 = otu[,otu_stool_idx]
+genus_stool               = apply(otu_stool, 2, tapply, tax_tmp, sum)
+genus_stool.norm          = prop.table(as.matrix(genus_stool),2)
+genus_stool.norm.denoized = noise.removal(genus_stool.norm, percent = 1)
+genus_stool.int.denoized  = genus_stool[rownames(genus_stool.norm.denoized),]
+
+```
+
+
+
+```{r fit_genus_stratification, eval=TRUE}
+fit_genus_list = vector("list",5)
+
+if(str_length(system.file("extData", "fit_genus.rda", package = "IBSMicrobiota")) == 0) {
+#fit_genus <- mclapply(1:6, dmn, count=t(genus.count), verbose=TRUE)
+
+set.seed(444); seeds=sample(1:1000, 5)
+
+  for(i in 1:5) {
+    set.seed(seeds[i])
+    fit_genus <- mclapply(1:6, dmn, count=t(genus_stool.int.denoized), verbose=TRUE, mc.cores=16)
+    fit_genus_list[[i]] = fit_genus
+  }
+  save(fit_genus, file=("../inst/extData/fit_genus.rda"))
+  save(fit_genus_list, file=("../inst/extData/fit_genus_list.rda"))
+
+} else {load(system.file("extData", "fit_genus.rda", package = "IBSMicrobiota")); load(system.file("extData", "fit_genus_list.rda", package = "IBSMicrobiota"))}
+
+
+
+
+lplc = vector("list",5)
+
+for(i in 1:5) {
+  lplc[[i]] <- sapply(fit_genus_list[[i]], function(x){attr(x,"goodnessOfFit")[["Laplace"]]})
+}
+
+#(best_genus <- fit_genus_list[[5]][[which.min(lplc[[1]])]])
+(best_genus <- fit_genus_list[[5]][[3]])
+
+```
+
+
+```{r DMN_laplace_BIC_genus, fig.show="hide", fig.cap="Fitting the OTU abundance data to \n Dirichlet multinomial mixture models \n(ramdom seed)", fig.height=4, fig.width=8}
+
+bic_results=melt(data.frame(sapply(fit_genus_list, sapply, BIC), nb.clust=1:6), id.vars="nb.clust")
+laplace_results=melt(data.frame(sapply(fit_genus_list, sapply, laplace), nb.clust=1:6), id.vars="nb.clust")
+
+p1_bic = ggplot(bic_results) + geom_line(aes(x=nb.clust, y=value, group=variable)) + ylab("BIC") + xlab("Number of clusters")
+p2_laplace = ggplot(laplace_results) + geom_line(aes(x=nb.clust, y=value, group=variable)) + ylab("Laplace") + xlab("Number of clusters")
+
+#grid.arrange(p1,p2, ncol=2)
+
+```
+
+
+BIC and Laplace estimators indicated that 3 microbiota types were detected. 
+For downstream analysis, we explored only 3 microbiota types.
+
+
+
+____________________________________________________________________________________________________
+
+
+```{r enterotypes_distribution_health, fig.cap="Enterotypes distribution according Health status)", fig.height=6, fig.width=13}
+
+microbiota_type = mixture(best_genus, assign=TRUE)
+
+idx_bacteroides   = grep("Bacteroidaceae.Bacteroides",row.names(genus_stool.norm.denoized[,names(microbiota_type)]))
+idx_prevotella    = grep("Prevotellaceae.Prevotella",row.names(genus_stool.norm.denoized[,names(microbiota_type)]))
+idx_clostridiales = grep("Clostridiales",row.names(genus_stool.norm.denoized[,names(microbiota_type)]))
+
+metadata.enterotypes = data.frame(metadata[names(microbiota_type),], enterotypes=microbiota_type)
+metadata.enterotypes$IBS_subtypes = factor(metadata.enterotypes$IBS_subtypes, levels=c("Healthy","IBS-C","IBS-D","IBS-M"))
+
+metadata.enterotypes[metadata.enterotypes$Health == "control", "IBS.Severity.Score"] <- NA #fix IBS-SSS in H control
+
+metadata.enterotypes$Bacteroides   = genus_stool.norm.denoized[idx_bacteroides  ,names(microbiota_type)]
+metadata.enterotypes$Prevotella    = genus_stool.norm.denoized[idx_prevotella   ,names(microbiota_type)]
+metadata.enterotypes$Clostridiales = apply(genus_stool.norm.denoized[idx_clostridiales,names(microbiota_type)], 2, sum)
+
+
+p9_enterotypes_prop_severe = ggplot(melt(prop.table(table(metadata.enterotypes[which(metadata.enterotypes$Visit=="V4"),]$SSgroup, metadata.enterotypes[which(metadata.enterotypes$Visit=="V4"),]$enterotypes),1)))
+p9_enterotypes_prop_severe = p9_enterotypes_prop_severe + geom_bar(aes(x=Var1, y=value, fill=as.character(Var2)), stat="identity",width=0.95)
+p9_enterotypes_prop_severe = p9_enterotypes_prop_severe + scale_x_discrete(labels=c("Healthy","mild\nIBS","moderate\nIBS","severe\nIBS"))  + scale_y_continuous(label = percent) 
+p9_enterotypes_prop_severe = p9_enterotypes_prop_severe + xlab("") + ylab("Enterotypes proportion") 
+p9_enterotypes_prop_severe = p9_enterotypes_prop_severe + scale_fill_brewer("Enterotypes and\n associated taxa",type = "qual",palette="Set1", labels=c("1: Clostridiales","2: Bacteroides","3: Prevotella"))
+p9_enterotypes_prop_severe = p9_enterotypes_prop_severe + theme(legend.position=c(0.8,0.3)) 
+
+
+p10_enterotypes_prop_subtypes = ggplot(melt(prop.table(table(metadata.enterotypes[which(metadata.enterotypes$Visit=="V4"),]$IBS_subtypes, metadata.enterotypes[which(metadata.enterotypes$Visit=="V4"),]$enterotypes),1)))
+p10_enterotypes_prop_subtypes = p10_enterotypes_prop_subtypes  + geom_bar(aes(x=Var1, y=value, fill=as.character(Var2)), stat="identity",width=0.95) + scale_y_continuous(label = percent) 
+p10_enterotypes_prop_subtypes = p10_enterotypes_prop_subtypes  + xlab("") + ylab("Enterotypes proportion") + scale_fill_brewer(type = "qual",palette="Set1") 
+p10_enterotypes_prop_subtypes = p10_enterotypes_prop_subtypes  + guides(fill=FALSE)
+
+p11_richness_microbiota = ggplot(metadata.enterotypes[which(metadata.enterotypes$Visit=="V4"),]) + geom_boxplot(aes(x=as.character(enterotypes),fill=as.character(enterotypes), y=richness))
+p11_richness_microbiota = p11_richness_microbiota  + xlab("Enterotypes") + ylab("Microbial richness\n(Number of OTUs)")
+p11_richness_microbiota = p11_richness_microbiota  + scale_fill_brewer(type = "qual",palette="Set1") + guides(fill=FALSE)
+
+p12_drivers = ggplot(
+  melt(
+    metadata.enterotypes[,
+      names(metadata.enterotypes) %in% c("enterotypes","Bacteroides","Prevotella","Clostridiales")],
+    id.vars="enterotypes"
+  )
+) 
+
+
+p14_drivers2 = p12_drivers  + geom_boxplot(aes(x=as.character(variable), y=value, fill=as.character(enterotypes)))
+p14_drivers2 = p14_drivers2 + scale_fill_brewer("Enterotypes", labels=c("1","2","3"), type = "qual",palette="Set1") + scale_y_continuous(label = percent)
+#p14 = p14 + facet_wrap(~variable, scales="free_y",ncol=1) 
+p14_drivers2 = p14_drivers2 + scale_x_discrete(limits=c("Clostridiales","Bacteroides","Prevotella"))
+p14_drivers2 = p14_drivers2 + xlab("Enterotypes associated bacterial taxa") + ylab("Relative abundance") #+ guides(fill=FALSE) 
+p14_drivers2 = p14_drivers2 + theme(legend.position=c(0.9,0.9))
+
+
+p13_enterotypes_proportions = ggplot(melt(prop.table(table(metadata.enterotypes$enterotypes))))
+p13_enterotypes_proportions = p13_enterotypes_proportions + geom_bar(aes(x=Var1, y=value, fill=as.character(Var1)),stat="identity", position="dodge")
+p13_enterotypes_proportions = p13_enterotypes_proportions + scale_y_continuous("samples proportions",label = percent) + xlab("Enterotypes")
+p13_enterotypes_proportions = p13_enterotypes_proportions + scale_fill_brewer(type = "qual",palette="Set1") + guides(fill=FALSE)
+
+
+p12_drivers  = p12_drivers + geom_boxplot(aes(x=as.character(enterotypes), y=value, fill=as.character(enterotypes)))
+p12_drivers  = p12_drivers  + scale_fill_brewer(type = "qual",palette="Set1") + scale_y_continuous(label = percent) 
+p12_drivers  = p12_drivers  + facet_wrap(~variable, scales="free_y",ncol=1) + guides(fill=FALSE) 
+p12_drivers  = p12_drivers + xlab("Enterotypes") + ylab("relative abundance")
+
+grid.arrange(arrangeGrob(p1_bic,p2_laplace, nrow=2), arrangeGrob(p11_richness_microbiota,p13_enterotypes_proportions, nrow=2) , p12_drivers, arrangeGrob(p10_enterotypes_prop_subtypes ,p9_enterotypes_prop_severe, nrow=2), ncol=4, widths=c(1,0.75,0.75,1.25))
+
+
+
+```
+
+**Figure 4: Enterotypes stratitification and distribution according Health status**. 
+(Top panel) BIC and Laplace estimator indocated that 3 type of microbiota are deteceted in the dataset.
+(Bottom panel) Microbial enterotypes were independant from IBS severity and subtypes. There is a trend with an enrichment of Bacteroides-enriched enterotypes and less prevotella-enriched enterotypes.
+
+____________________________________________________________________________________________________
+
+No difference between group was observed regarding enterotypes distribution.
+
+
+
+```{r additional_metadata_enterotypes_analysis}
+
+
+p16_enterotypes_gender = ggplot(melt(prop.table(table(metadata.enterotypes[which(metadata.enterotypes$Visit=="V4"),]$Gender, metadata.enterotypes[which(metadata.enterotypes$Visit=="V4"),]$enterotypes),1)))
+p16_enterotypes_gender = p16_enterotypes_gender + geom_bar(aes(x=Var1, y=value, fill=as.character(Var2)), stat="identity",width=0.95) + scale_y_continuous(label = percent) 
+p16_enterotypes_gender = p16_enterotypes_gender + xlab("Gender") + ylab("Enterotypes proportion") + scale_fill_brewer(type = "qual",palette="Set1") 
+p16_enterotypes_gender = p16_enterotypes_gender + guides(fill=FALSE)
+
+
+
+p30_enterotypes_health = ggplot(melt(prop.table(table(metadata.enterotypes[which(metadata.enterotypes$Visit=="V4"),]$Health, metadata.enterotypes[which(metadata.enterotypes$Visit=="V4"),]$enterotypes),1)))
+p30_enterotypes_health = p30_enterotypes_health + geom_bar(aes(x=Var1, y=value, fill=as.character(Var2)), stat="identity",width=0.95) + scale_y_continuous(label = percent) 
+p30_enterotypes_health = p30_enterotypes_health + xlab("") + ylab("Enterotypes proportion") 
+p30_enterotypes_health = p30_enterotypes_health + scale_fill_brewer("Enterotypes", type = "qual",palette="Set1", labels=c("1: Clostr.","2: Bacter.","3: Prevo.")) 
+#p30 = p30 + guides(fill=FALSE)
+
+
+#chisq.test(table(metadata.enterotypes[which(metadata.enterotypes$Visit=="V4"),]$SSgroup, metadata.enterotypes[which(metadata.enterotypes$Visit=="V4"),]$enterotypes))
+#chisq.test(table(metadata.enterotypes[which(metadata.enterotypes$Visit=="V4"),]$IBS_subtypes, metadata.enterotypes[which(metadata.enterotypes$Visit=="V4"),]$enterotypes))
+#chisq.test(table(metadata.enterotypes[which(metadata.enterotypes$Visit=="V4"),]$Health, metadata.enterotypes[which(metadata.enterotypes$Visit=="V4"),]$enterotypes))
+
+
+metadata.enterotypes_2 = metadata.enterotypes
+
+names(metadata.enterotypes_2)[names(metadata.enterotypes_2)=="HAD.DEPRES"]  = "HAD Depress."
+names(metadata.enterotypes_2)[names(metadata.enterotypes_2)=="HAD.ANXIETY"] = "HAD Anxiety"
+names(metadata.enterotypes_2)[names(metadata.enterotypes_2)=="BSF.Mean_Frequenc_StoolPerDay"] = "Average Stool per day"
+names(metadata.enterotypes_2)[names(metadata.enterotypes_2)=="BSF.Mean_Stoolform_total"] = "Average BSF Scale"
+names(metadata.enterotypes_2)[names(metadata.enterotypes_2)=="transit.days"] = "OATT (days)"
+names(metadata.enterotypes_2)[names(metadata.enterotypes_2)=="Age"] = "Age (Years)"
+names(metadata.enterotypes_2)[names(metadata.enterotypes_2)=="H2"] = "H2 (ppm)"
+names(metadata.enterotypes_2)[names(metadata.enterotypes_2)=="CH4"] = "CH4 (ppm)"
+names(metadata.enterotypes_2)[names(metadata.enterotypes_2)=="IBS.Severity.Score"] = "IBS-SSS"
+
+
+
+
+
+enterotypes_melt =melt(metadata.enterotypes_2[,c(7,9,12,13,14,17,22,23,24,25,26,28)], id.vars=c("enterotypes","Health"))
+
+
+
+
+enterotypes_test_res = lapply(split(na.omit(enterotypes_melt), na.omit(enterotypes_melt)$variable),
+    function(df){
+        lapply(split(df, df$Health), function(d){
+           pairwise.wilcox.test(d$value,d$enterotypes, conf.int= TRUE, p.adjust.method= "none")
+       })
+    })
+    
+    
+    
+enterotypes_test_res = cbind(sapply(enterotypes_test_res, function(l) { lapply(l,function(x) x$p.value[1]) }),
+                                sapply(enterotypes_test_res, function(l) { lapply(l,function(x) x$p.value[2]) }),
+                                sapply(enterotypes_test_res, function(l) { lapply(l,function(x) x$p.value[4]) }))
+    
+    
+    
+    
+#p.value fdr enterotypes by health status    
+enterotypes_test_res = matrix(p.adjust(enterotypes_test_res, method="fdr"),nc=dim(enterotypes_test_res)[2], dimnames=dimnames(enterotypes_test_res))
+
+
+
+
+
+p17_enterotypes_clinical = ggplot(enterotypes_melt, aes(x=Health, y=value, fill=as.character(enterotypes)  )  ) +
+geom_violin(position=position_dodge()) + scale_fill_brewer(type = "qual",palette="Set1") +
+geom_boxplot(width=0.2, position=position_dodge(0.9), aes(fill=NULL, group=interaction(Health,enterotypes))) +
+facet_wrap(~variable, nrow=2, scales="free_y" ) + ylab("") +  guides(fill=FALSE)
+
+
+
+#ggplot(melt(metadata.enterotypes[,c(5,28)], id.vars=c("enterotypes"))) + geom_bar(aes(x=as.character(enterotypes), y=variable))
+
+#ggplot(na.omit(melt(metadata.enterotypes[,c(5,18,21,28)], id.vars=c("Methanogens_qPCR","enterotypes")))) + geom_bar(aes(group=as.character(Methanogens_qPCR), x=variable,  fill=enterotypes), position="dodge") + facet_wrap(~variable, ncol=3)
+
+#ggplot(na.omit(melt(metadata.enterotypes[,c(5,18,21,28)], id.vars=c("Methanogens_qPCR","enterotypes")))) + 
+#geom_bar(aes(x=as.character(Methanogens_qPCR), fill=as.character(enterotypes))) + facet_wrap(~value, nrow=2)
+
+
+#ggplot(melt(prop.table(table(metadata.enterotypes$enterotypes, metadata.enterotypes$Methanogens_qPCR),2))) + 
+#geom_bar(aes(x=as.character(Var2), fill=as.character(Var1), y=value), stat="identity")
+
+
+# 1) CH4 vs methano
+
+p_ch4_methano = ggplot(na.omit(metadata.enterotypes[,c(5,14)])) +  
+geom_violin(aes(x=as.character(Methanogens_qPCR), y=CH4, fill=as.character(Methanogens_qPCR)),position=position_dodge()) + 
+geom_boxplot(aes(x=as.character(Methanogens_qPCR), y=CH4),width=0.1, position=position_dodge(0.9)) +  
+guides(fill=FALSE) + ylab("exhaled CH4 (ppm)") + 
+#xlab(paste0("Methanobacteriales (n=",dim(na.omit(metadata.enterotypes[,c(5,14)]))[1]," samples)")) +
+ xlab("Methanobacteriales")+
+scale_x_discrete(label=c("Undetected","Detected"))
+
+
+# 2) methano vs enterotypes
+
+p_methano_enterotype = ggplot(na.omit(metadata.enterotypes[,c(5,28)])) +
+geom_bar(aes(fill=as.character(enterotypes), x=as.character(Methanogens_qPCR)), position="dodge") +
+scale_fill_brewer("Enterotypes",type = "qual",palette="Set1", labels=c("1:Clostridiales","2:Bacteroides","3:Prevotella")) + 
+scale_x_discrete(label=c("Undetected","Detected")) +
+ xlab("Methanobacteriales")+
+#xlab(paste0("Methanobacteriales (n=",dim(na.omit(metadata.enterotypes[,c(5,28)]))[1]," samples)")) + 
+ylab("nb of stool samples") 
+
+
+
+# 3) methano vs subtypes
+
+p_methano_subtypes = ggplot(na.omit(metadata.enterotypes[,c(5,21)])) +
+geom_bar(aes(fill=as.character(IBS_subtypes), x=as.character(Methanogens_qPCR)), position="fill") +
+scale_x_discrete(label=c("Undetected","Detected")) +
+#xlab(paste0("Methanobacteriales (n=",dim(na.omit(metadata.enterotypes[,c(5,21)]))[1]," samples)")) + 
+ xlab("Methanobacteriales")+
+ylab("proportion of stool samples") +
+scale_fill_manual("", labels = c("Healthy","IBS-C","IBS-D","IBS-M"), 
+                                values = c(rev(brewer.pal(n=4, name="BrBG"))[1], dan_pal("dan1")(3)))
+
+
+
+# 4) methano vs severity
+
+
+p_methano_severity = ggplot(na.omit(metadata.enterotypes[,c(5,18)])) +
+geom_bar(aes(fill=as.character(SSgroup), x=as.character(Methanogens_qPCR)), position="fill") +
+scale_x_discrete(label=c("Undetected","Detected")) +
+#xlab(paste0("Methanobacteriales (n=",dim(na.omit(metadata.enterotypes[,c(5,18)]))[1]," samples)")) + 
+ xlab("Methanobacteriales")+
+ylab("proportion of stool samples") +
+scale_fill_manual("", labels = c("Healthy","Mild","Moderate","Severe"), 
+                                values = c(rev(brewer.pal(n=4, name="BrBG")) ))
+
+
+# 5) facet_grid severity~subtypes, x=methano, fill=enterotypes
+
+# ggplot(na.omit(metadata.enterotypes[,c(5,18,21,28)])) + geom_bar(aes(fill=as.character(Methanogens_qPCR), x=as.character(enterotypes)), position="dodge")  + facet_grid(IBS_subtypes~SSgroup)
+
+
+df_meth_enterotype = melt(table(metadata.enterotypes$enterotypes, 
+                                metadata.enterotypes$Methanogens_qPCR, 
+                                metadata.enterotypes$IBS_subtypes,
+                                metadata.enterotypes$SSgroup
+                                )
+                         )
+
+
+
+
+```
+
+
+
+
+```{r}
+
+# pdf("../inst/figures/Tap_Figure_enterotypes_old.pdf", h=6, w=12)
+
+# grid.arrange(
+  # arrangeGrob(p1+theme_bw(),p2+theme_bw(), nrow=2), 
+  # arrangeGrob(p11+theme_bw(),p13+theme_bw(), nrow=2) ,
+  # p12+theme_bw(), 
+  # arrangeGrob(p10+theme_bw(),p9+theme_bw()+theme(legend.position=c(0.8,0.3)), nrow=2), 
+  # ncol=4, widths=c(1,0.75,0.75,1.25))
+
+# dev.off()
+
+
+pdf("../inst/figures/Tap_Figure_enterotypes.pdf", h=7, w=9)
+
+grid.arrange(
+  arrangeGrob(p14_drivers2 +theme_bw() + theme(legend.position=c(0.8,0.8)), p11_richness_microbiota+theme_bw(), ncol=2, widths=c(2.8,1.2)),
+  arrangeGrob(p10_enterotypes_prop_subtypes+theme_bw(),p9_enterotypes_prop_severe+theme_bw()+theme(legend.position=c(0.7,0.4)), ncol=2), 
+  nrow=2)
+  
+
+dev.off()
+
+
+
+Tap_Figure_enterotypes_cowplot = plot_grid(
+
+plot_grid(p14_drivers2 +theme_bw() + theme(legend.position=c(0.8,0.8)), p11_richness_microbiota+theme_bw(), ncol=2, rel_widths=c(2.8,1.2), labels=c("A","B")),
+plot_grid(p10_enterotypes_prop_subtypes+theme_bw(),p9_enterotypes_prop_severe+theme_bw()+theme(legend.position=c(0.7,0.4)), ncol=2, labels=c("C","D")),
+
+  nrow=2)
+
+
+
+
+pdf("../inst/figures/Tap_Figure_enterotypes_cowplot.pdf", h=7, w=9)
+
+Tap_Figure_enterotypes_cowplot
+
+
+dev.off()
+
+
+
+
+
+
+pdf("../inst/figures/Tap_FigureSupp_enterotypes.pdf", h=3, w=9)
+
+grid.arrange(p1_bic+theme_bw(),p2_laplace+theme_bw(),p13_enterotypes_proportions+theme_bw(), ncol=3)
+  
+  
+dev.off()
+
+
+
+Tap_FigureSupp_enterotypes_cowplot=
+plot_grid(p1_bic+theme_bw(),p2_laplace+theme_bw(),p13_enterotypes_proportions+theme_bw(), ncol=3, labels=LETTERS[1:3])
+  
+  
+
+pdf("../inst/figures/Tap_FigureSupp_enterotypes_cowplot.pdf", h=3, w=9)
+Tap_FigureSupp_enterotypes_cowplot
+dev.off()
+
+
+
+
+pdf("../inst/figures/Tap_FigureSupp2_enterotypes.pdf", h=6, w=17)
+
+grid.arrange(p17_enterotypes_clinical+theme_bw(),p16_enterotypes_gender+theme_bw(), p30_enterotypes_health+theme_bw()+theme(legend.position=c(0.5,0.2)), ncol=3, widths=c(6,1,1))
+  
+  
+dev.off()
+
+Tap_FigureSupp2_enterotypes=
+plot_grid(p17_enterotypes_clinical+theme_bw(),p16_enterotypes_gender+theme_bw(), p30_enterotypes_health+theme_bw()+theme(legend.position=c(0.5,0.2)), ncol=3, rel_widths=c(6,1,1), labels=LETTERS[1:3])
+   
+
+
+pdf("../inst/figures/Tap_FigureSupp2_enterotypes_cowplot.pdf", h=6, w=17)
+Tap_FigureSupp2_enterotypes
+  
+dev.off()
+
+
+
+pdf("../inst/figures/Tap_FigureSupp_methano.pdf", h=7, w=10)
+
+grid.arrange(
+  p_ch4_methano+theme_bw(),
+  p_methano_enterotype+theme_bw()+theme(legend.position=c(0.8,0.8)), 
+  p_methano_subtypes+theme_bw()+theme(legend.position=c(0.8,0.3)), 
+  p_methano_severity+theme_bw()+theme(legend.position=c(0.8,0.3)), ncol=2) 
+
+  
+dev.off()
+
+
+Tap_FigureSupp_methano_cowplot=
+plot_grid(
+  p_ch4_methano+theme_bw(),
+  p_methano_enterotype+theme_bw()+theme(legend.position=c(0.8,0.8)), 
+  p_methano_subtypes+theme_bw()+theme(legend.position=c(0.8,0.3)), 
+  p_methano_severity+theme_bw()+theme(legend.position=c(0.8,0.3)), ncol=2, labels=LETTERS[1:4] ) 
+
+  
+
+
+pdf("../inst/figures/Tap_FigureSupp_methano_cowplot.pdf", h=7, w=10)
+Tap_FigureSupp_methano_cowplot
+dev.off()
+
+
+
+
+
+
+
+
+
+```
+
+
+
+
+
+
+#### Co-inertia analysis between stool and biopsies
+
+Biopsy was different from stool regarding microbial richness (lower) and global microbial composition as expected. However, we showed here that stool and biopsy from the same patient co-varied signicantly together meaning that stool is a good proxy to check relative variation in biopsy.
+
+____________________________________________________________________________________________________
+
+
+```{r coinertia_genus_biopsy, fig.cap="Coinertia analysis between stool and biopsy", fig.height=6, fig.width=12}
+
+patient.paired = intersect(metadata$Patient_ID[which(metadata$Sample_type=="Biopsy")] , metadata$Patient_ID[which(metadata$Sample_type=="Stool" & metadata$Visit=="V4"  )])
+sample.paired  = row.names(metadata[which( metadata$Patient_ID %in% patient.paired & (metadata$Sample_type=="Biopsy" | metadata$Sample_type=="Stool") & metadata$Visit=="V4"),])
+
+biopsy.paired = sample.paired[which(metadata[sample.paired, ]$Sample_type=="Biopsy") ]
+stool.paired  = sample.paired[which(metadata[sample.paired, ]$Sample_type=="Stool") ]
+
+tax_tmp = paste(tax[,1],tax[,2],tax[,3],tax[,4], tax[,5],tax[,6], sep=".")
+
+paired_otu                 = otu[,c(biopsy.paired,stool.paired)]
+genus_paired               = apply(paired_otu, 2, tapply, tax_tmp, sum)
+genus_paired.norm          = prop.table(as.matrix(genus_paired),2)
+genus_paired.norm.denoized = noise.removal(genus_paired.norm, percent = 1)
+
+#to do: if needed, make a plot with genus_paired.norm.denoized
+
+genus_paired.norm.denoized.biopsy = data.frame(genus_paired.norm.denoized[, biopsy.paired])
+genus_paired.norm.denoized.stool = data.frame(genus_paired.norm.denoized[, stool.paired])
+
+names(genus_paired.norm.denoized.biopsy ) = names(genus_paired.norm.denoized.stool) = patient.paired
+
+genus_paired.norm.denoized.biopsy.jsd = dist.JSD(genus_paired.norm.denoized.biopsy)
+genus_paired.norm.denoized.stool.jsd  = dist.JSD(genus_paired.norm.denoized.stool)
+
+
+biopsy.pco = dudi.pco(genus_paired.norm.denoized.biopsy.jsd , scannf=F, nf=3)
+stool.pco  = dudi.pco(genus_paired.norm.denoized.stool.jsd  , scannf=F, nf=3)
+paired.coi = coinertia(biopsy.pco,stool.pco, scannf=F, nf=3)
+pc_eig     = round(paired.coi$eig/ sum(paired.coi$eig),3) * 100
+
+RV.obs = coinertia(biopsy.pco,stool.pco, scannf=F, nf=3)$RV
+RV.sim = 1:99
+for(i in 1:99) {
+
+s1 = sample(1:length(patient.paired))
+genus_paired.norm.denoized.biopsy.jsd.sim = as.dist(as.matrix(genus_paired.norm.denoized.biopsy.jsd)[s1,s1]) 
+
+s2 = sample(1:length(patient.paired))
+genus_paired.norm.denoized.stool.jsd.sim = as.dist(as.matrix(genus_paired.norm.denoized.biopsy.jsd)[s2,s2]) 
+
+biopsy.pco.sim = dudi.pco(genus_paired.norm.denoized.biopsy.jsd.sim , scannf=F, nf=3)
+stool.pco.sim  = dudi.pco(genus_paired.norm.denoized.stool.jsd.sim  , scannf=F, nf=3)
+
+RV.sim[i] = coinertia(biopsy.pco.sim, stool.pco.sim, scannf=F, nf=3)$RV
+
+}
+
+## at phylum levels for the boxplot figure
+tax_tmp_phylum = paste(tax[,1],tax[,2], sep=".")
+
+paired_otu                  = otu[,c(biopsy.paired,stool.paired)]
+phylum_paired               = apply(paired_otu, 2, tapply, tax_tmp_phylum, sum)
+phylum_paired.norm          = prop.table(as.matrix(phylum_paired),2)
+phylum_paired.norm.denoized = noise.removal(phylum_paired.norm, percent = 5)
+
+
+
+p2_richness_biopsy  = ggplot(metadata[metadata$Patient_ID %in% patients_with_biopsy, ], aes(y=richness, x=Sample_type)) 
+p2_richness_biopsy  = p2_richness_biopsy + geom_boxplot(aes(fill=Sample_type))
+p2_richness_biopsy  = p2_richness_biopsy + guides(fill=FALSE) + xlab("") + ylab("Number of OTUs")
+
+
+p13_RV = ggplot(data.frame(RV=RV.sim), aes(x=RV)) + geom_histogram() +
+      xlim(0, 1) + xlab("Simulated RV") + 
+      geom_segment(x=RV.obs, y=0, xend=RV.obs, yend=17, linetype=2, col="red") + 
+	    annotate("text", x = RV.obs, y = 20, colour = "red", size = 5, label="observed RV")
+
+
+names(paired.coi$lX) = names(paired.coi$lY)
+	  
+df.paired = data.frame(rbind(paired.coi$lX,paired.coi$lY), 
+            sample_type = 
+            c(rep("Biopsy",dim(paired.coi$lX)[1]),rep("Stool",dim(paired.coi$lX)[1])),
+            t(phylum_paired.norm.denoized)
+            )    
+    
+p14_biopsy_coi = ggplot(df.paired , aes(x=AxcY1,y=AxcY2 )) + 
+	    geom_segment(data=cbind(paired.coi$lX,paired.coi$lY), aes(x=paired.coi$lX[,1], y=paired.coi$lX[,2], xend=paired.coi$lY[,1], yend=paired.coi$lY[,2])  ) +
+	    geom_point(aes(col=sample_type), size=5, alpha=0.8) + 
+      xlab(paste("PC1",pc_eig[1],"%")) + ylab(paste("PC2",pc_eig[2],"%")) + scale_color_discrete("Sample Type")
+p14_biopsy_coi  = p14_biopsy_coi  + theme(legend.position=c(0.8,0.1))
+
+
+p15_phylum = ggplot(melt(df.paired[,4:(dim(df.paired)[2]-2)], id.vars="sample_type")) 
+p15_phylum = p15_phylum + geom_boxplot(aes(x=variable,y=value,fill=sample_type))
+p15_phylum = p15_phylum + scale_x_discrete("Phylum",labels=c("Bacteroidetes","Firmicutes","Proteobacteria","Actinobacteria"))
+p15_phylum = p15_phylum + scale_y_log10("Relative abundance",label=percent)
+p15_phylum = p15_phylum + scale_fill_discrete("Sample Type") #+ theme(legend.position=c(0.1,0.1)) + guides(fill=FALSE) 
+
+
+
+#grid.arrange(p14,arrangeGrob(arrangeGrob(p13,p2 + guides(fill=FALSE), ncol=2, widths=c(1.25,0.75)),p15,nrow=2, widths=c(0.5,1.50)), ncol=2, widths=c(1.25,1))
+
+
+
+#grid.arrange(arrangeGrob(arrangeGrob(p13,p2 + guides(fill=FALSE), ncol=2, widths=c(1.25,0.75)),p15,nrow=2, widths=c(0.5,1.50)),p14, ncol=2, widths=c(1,1.25))
+
+
+	  
+```
+
+**Figure 5: Coinertia analysis between stool and biopsy**. 
+(left panel) Stool and biopsy collected from the same patient were paired and were subjected to a 
+co-inertia analysis. Dash lines linked paired sample and color accounted for sample type. 
+(top right panel) The co-inertia structure were supported by a significant Monte-carlo test showing 
+an observed RV coefficient higher than simulted RV coefficient. 
+(bottom right panel) Although a significant co-inertia structure shared between stool and biopsy, 
+biopsy richness is significantly lower than stool richness.
+
+____________________________________________________________________________________________________
+
+
+> DONE: add an additional figures with stool/biopsy differences at phylum levels abundances.
+> TO DO: put a title on pdf file
+
+```{r}
+
+
+
+pdf("../inst/figures/Tap_Figure_stool_biopsy.pdf", h=6, w=12)
+
+
+grid.arrange(
+  
+  arrangeGrob(
+    p15_phylum + theme_bw() + theme(legend.position=c(0.15,0.2)),
+    arrangeGrob(
+      p2_richness_biopsy + theme_bw() + guides(fill=FALSE) ,
+      p13_RV + theme_bw(),      
+      ncol=2, widths=c(0.75,1.25)
+    ),
+    nrow=2, widths=c(1.5,0.50)
+  ),
+  p14_biopsy_coi + theme_bw() + theme(legend.position=c(0.8,0.1)),
+  ncol=2, widths=c(1,1.25)
+)
+
+
+
+
+dev.off()
+
+
+
+
+
+
+Tap_Figure_stool_biopsy_cowplot = plot_grid(
+  
+  plot_grid(
+    plot_grid(p15_phylum  + theme_cowplot(font_size=12) + theme(legend.position=c(0.15,0.2)), labels="A"),
+    plot_grid(
+      p2_richness_biopsy  + theme_cowplot(font_size=12) + guides(fill=FALSE) ,
+      p13_RV + theme_cowplot(font_size=12),      
+      ncol=2, rel_widths=c(0.75,1.25), labels=c("B","C")
+    ),
+    nrow=2, rel_widths=c(1.5,0.50)
+  ),
+  plot_grid(p14_biopsy_coi + theme_cowplot(font_size=12) + theme(legend.position=c(0.8,0.1)), labels="D"),
+  ncol=2, rel_widths=c(1,1.25)
+)
+
+
+
+
+pdf("../inst/figures/Tap_Figure_stool_biopsy_cowplot.pdf", h=6, w=13)
+Tap_Figure_stool_biopsy_cowplot 
+
+dev.off()
+
+
+
+
+
+
+
+
+
+```
+
+
+
+
+### Discriminating analysis of between IBS and healthy at OTU levels
+
+We have made univariate test (unparametric wilcoxcon test) to compare IBS and healthy 
+stool microbiota at OTU levels. In total, more than 2,900 OTUS was deteceted. The made problem
+ with such analysis on this king of dataset was to find significant OTU just by chance.
+This analysis was useful to determine if there was a intersting signal from severity and IBS subtypes.
+
+
+```{r univariate_test}
+
+#idx.stool.explo      =  which(metadata$Sample_type=="Stool" & metadata$study_group.x=="exploratory")
+idx.stool.explo      =  which(metadata$Sample_type=="Stool")
+otu.stool.explo      = prop.table(as.matrix(otu[,idx.stool.explo]),2)
+metadata.stool.explo = metadata[idx.stool.explo,]
+
+#rboot     = 5
+#univ.test = matrix(nr=dim(otu.stool.explo)[1]*rboot, nc=10)
+
+#rownames(univ.test) = row.names(otu.stool.explo)
+
+#for(boot in 1:rboot) {
+
+#  for(i in 1:dim(otu.stool.explo)[1]){
+
+#    idx.Healthy  = sample(which(metadata.stool.explo$Health      =="control"), 30, replace=FALSE)
+#    idx.Healthy2 = sample(which(metadata.stool.explo$Health      =="control"), 30, replace=FALSE)
+#    idx.IBS      = sample(which(metadata.stool.explo$Health      =="patient"), 30, replace=FALSE)
+#    idx.mild     = sample(which(metadata.stool.explo$SSgroup     =="mild"),    30, replace=FALSE)
+#    idx.moderate = sample(which(metadata.stool.explo$SSgroup     =="moderate"),30, replace=FALSE)
+#    idx.severe   = sample(which(metadata.stool.explo$SSgroup     =="severe"),  30, replace=FALSE)
+#   idx.ibs_c    = sample(which(metadata.stool.explo$IBS_subtypes=="IBS-C"),   30, replace=FALSE)
+#    idx.ibs_d    = sample(which(metadata.stool.explo$IBS_subtypes=="IBS-D"),   30, replace=FALSE)
+#    idx.ibs_m    = sample(which(metadata.stool.explo$IBS_subtypes=="IBS-M"),   30, replace=FALSE)
+#    idx.ibs_u    = which(metadata.stool.explo$IBS_subtypes=="IBS-U")
+
+#    #Healthy_vs_Healthy
+#    r0 = wilcox.test(otu.stool.explo[i,c(idx.Healthy)], otu.stool.explo[i,c(idx.Healthy2)])$p.value
+
+#    #Healthy_vs_IBS
+#    r1 = wilcox.test(otu.stool.explo[i,c(idx.Healthy,idx.IBS)]~metadata.stool.explo$Health[c(idx.Healthy,idx.IBS)])$p.value
+  
+#    #Healthy_vs_Severity
+#    r2 = pairwise.wilcox.test(otu.stool.explo[i,c(idx.Healthy,idx.mild,idx.moderate,idx.severe)],
+#      metadata.stool.explo$SSgroup[c(idx.Healthy,idx.mild,idx.moderate,idx.severe)],p.adjust="none" )$p.value[,1]
+
+#    #Healthy_vs_subtypes
+#    r3 = pairwise.wilcox.test(otu.stool.explo[i,c(idx.Healthy,idx.ibs_c,idx.ibs_d,idx.ibs_m, idx.ibs_u)],
+#      metadata.stool.explo$IBS_subtypes[c(idx.Healthy,idx.ibs_c,idx.ibs_d,idx.ibs_m, idx.ibs_u)],p.adjust="none" )$p.value[4,]
+
+#    univ.test[i + ((boot-1)*rboot) ,] = c(IBS = r1, r2, r3, boot=boot, OTU = row.names(otu.stool.explo)[i] )
+    
+#    colnames(univ.test) = names(c(Healthy = r0, IBS = r1, r2, r3, boot = boot, OTU = row.names(otu.stool.explo)[i]))
+  
+
+#  }
+
+#}
+
+
+registerDoMC()
+options(cores=32)
+
+rboot     = 30
+univ.test = matrix(nr=dim(otu.stool.explo)[1], nc=10)
+
+rownames(univ.test) = row.names(otu.stool.explo)
+
+univ.test.all = foreach(boot = 1:rboot, .combine=rbind) %dopar% {
+
+  for(i in 1:dim(otu.stool.explo)[1]) {
+
+    idx.Healthy  = sample(which(metadata.stool.explo$Health      =="control"), 30, replace=FALSE)
+    idx.random1  = sample(1:length(metadata.stool.explo$Health),               30, replace=FALSE)
+    idx.random2  = sample(1:length(metadata.stool.explo$Health),               30, replace=FALSE)
+    
+    idx.IBS      = sample(which(metadata.stool.explo$Health      =="patient"), 30, replace=FALSE)
+    idx.mild     = sample(which(metadata.stool.explo$SSgroup     =="mild"),    30, replace=FALSE)
+    idx.moderate = sample(which(metadata.stool.explo$SSgroup     =="moderate"),30, replace=FALSE)
+    idx.severe   = sample(which(metadata.stool.explo$SSgroup     =="severe"),  30, replace=FALSE)
+    idx.ibs_c    = sample(which(metadata.stool.explo$IBS_subtypes=="IBS-C"),   30, replace=FALSE)
+    idx.ibs_d    = sample(which(metadata.stool.explo$IBS_subtypes=="IBS-D"),   30, replace=FALSE)
+    idx.ibs_m    = sample(which(metadata.stool.explo$IBS_subtypes=="IBS-M"),   30, replace=FALSE)
+    #idx.ibs_u    = which(metadata.stool.explo$IBS_subtypes=="IBS-U")
+
+    #Random
+    r0 = wilcox.test(otu.stool.explo[i,c(idx.random1)], otu.stool.explo[i,c(idx.random2)])$p.value
+
+    #Healthy_vs_IBS
+    r1 = wilcox.test(otu.stool.explo[i,c(idx.Healthy,idx.IBS)]~metadata.stool.explo$Health[c(idx.Healthy,idx.IBS)])$p.value
+  
+    #Healthy_vs_Severity
+    r2 = pairwise.wilcox.test(otu.stool.explo[i,c(idx.Healthy,idx.mild,idx.moderate,idx.severe)],
+      metadata.stool.explo$SSgroup[c(idx.Healthy,idx.mild,idx.moderate,idx.severe)],p.adjust="none" )$p.value[,1]
+
+
+    #Healthy_vs_subtypes
+    r3 = pairwise.wilcox.test(otu.stool.explo[i,c(idx.Healthy,idx.ibs_c,idx.ibs_d,idx.ibs_m)],
+      metadata.stool.explo$IBS_subtypes[c(idx.Healthy,idx.ibs_c,idx.ibs_d,idx.ibs_m)],p.adjust="none" )$p.value[3,]
+
+    univ.test[i,] = c(Ramdom = r0, IBS = r1, r2, r3, boot = boot, OTU = row.names(otu.stool.explo)[i] )
+    
+    colnames(univ.test) = names(c(Healthy = r0, IBS = r1, r2, r3, boot = boot, OTU = row.names(otu.stool.explo)[i]))
+
+  }
+  
+  return(univ.test)
+}
+
+
+
+
+univ.test.melt         =  melt(data.frame(univ.test.all), id.vars=c("boot","OTU"))
+names(univ.test.melt)  = c("boot","OTU","Health","p.value")
+univ.test.melt$p.value = as.numeric(as.character(univ.test.melt$p.value))
+univ.test.melt         = na.omit(univ.test.melt)
+univ.test.melt         = univ.test.melt[univ.test.melt$p.value < 0.05,] 
+
+
+otu.list = apply(table(univ.test.melt$OTU, univ.test.melt$Health), 2, function(x) names(which((x>(rboot/2)) == TRUE))  )
+
+#dev.new()
+#venn(otu.list[c("severe","IBS.C","IBS.D")])
+
+```
+
+
+____________________________________________________________________________________________________
+
+
+```{r univariates_test_plot_bootstrap, fig.height=5, fig.width=6}
+
+
+significant_threshold = quantile(table(univ.test.melt$boot, univ.test.melt$Health)[,1],0.95)[[1]]
+
+
+p13_univ_test = ggplot((melt(table(univ.test.melt$boot, univ.test.melt$Health)))) + geom_boxplot(aes(x=Var2, y=value))
+
+p13_univ_test = p13_univ_test + ylab("Number of significant OTUs per test") + xlab("Univariate wilcoxon test\n(100 bootstrap comparisons\n with 30 samples per group)")
+p13_univ_test = p13_univ_test + scale_x_discrete(label=c("Random\ncomparison", paste(c("all IBS Patients", "Mild IBS", "Moderate IBS", "Severe IBS","IBS-C","IBS-D","IBS-M","IBS-U (n=4)"), ("\nvs Healthy"))))
+p13_univ_test = p13_univ_test + geom_hline(yintercept=significant_threshold, linetype=2, col="red") + coord_flip() 
+p13_univ_test
+
+
+test_univ = melt(table(univ.test.melt$boot, univ.test.melt$Health))
+
+idx = which(test_univ$Var2 =="IBS.C" | test_univ$Var2 =="IBS.D" | test_univ$Var2 =="IBS.M" ) 
+
+p18_univ_test = ggplot(test_univ[-idx,]) + geom_boxplot(aes(x=Var2, y=value))
+
+p18_univ_test = p18_univ_test + ylab("Number of significant OTUs per test") + xlab("Univariate wilcoxon test\n(100 bootstrap comparisons\n with 30 samples per group)")
+p18_univ_test = p18_univ_test+ scale_x_discrete(label=c("Random\ncomparison", 
+paste(c("all IBS Patients", "Mild IBS", "Moderate IBS", "Severe IBS","IBS-C","IBS-D","IBS-M","IBS-U (n=4)"), ("\nvs Healthy"))))
+p18_univ_test = p18_univ_test + geom_hline(yintercept=significant_threshold, linetype=2, col="red") + coord_flip() + theme_bw()
+
+
+```
+
+**Figure 6: Univariates analysis according health status, severity and subtypes**. 
+30 samples were ramdomly taken for each group before non parametric wilcoxon test by OTUs.
+Random comparison allowed to show until 60 OTUs could significant just by chance. 
+Regarding severity, it seems that a significant number of OTU in IBS severe patient compared to healthy patients. Regarding subtypes, IBS-C appeard to be the most different comapred to healthy.
+
+____________________________________________________________________________________________________
+
+
+
+### Stable and robust OTU based IBS signature using machine learning
+
+Univariate test showed IBS severe and IBS-C microbiota might have some difference compared to Healthy microbiota.
+However, ramdom comparisons showed also that OTU could be significant just be chance. 
+To avoid such caveat due to sampling effect and/or heterogeneity of our cohort, 
+machine learning using LASSO model was used to select most robust OTU.
+
+Custom script allowing machine learning based on LASSO regression was used here.
+10 cross-validation and 10 bootstrap were realized to established 100 classification models.
+Cross-validation permitted to avoid statistical over-fitting and boostrapping allowed to
+homogenize data. Models were evaluated with AUROC analysis. 
+
+So, here are conditions which has been tested:
+
+```{r }
+all.roc.analyses = all.roc.dd = list(ControlvsIBS=NULL, RestvsSevere=NULL, MildvsSevere=NULL,IBS_CvsRest=NULL, RestvsSevere_genus = NULL)
+
+#merge two metadata set
+
+# metadata$Sample_ID = rownames(metadata)
+# metadata                  = merge(sample_metadata, lactulose_ibs_metadata, by.x = "Patient_ID", by.y = "Patient_ID"  )
+# row.names(metadata)       = metadata$Sample_ID
+```
+<!---
+- Control vs IBS at V4 and V5
+-->
+
+
+```{r }
+# preprocessing
+idx            = which(metadata$study_group=="exploratory" & metadata$Sample_type=="Stool")
+ibsV4V5_names  = rownames(metadata[idx,])
+otu_stool_V4V5 = otu_stool[, ibsV4V5_names]
+otu.denoized   = otu_stool_V4V5.denoized = noise.removal(prop.table(as.matrix(otu_stool_V4V5,2),2), percent=1)
+dd             = t(log10(otu.denoized+0.000001))
+lab            = as.factor(as.character(metadata[ibsV4V5_names,]$Health))
+levels(lab)    = c("1","-1")
+all.roc.dd[[1]]= list(dd=dd,lab=lab)
+```
+
+- Severe IBS vs rest at V4/V5
+
+```{r }
+# preprocessing
+idx            = which(metadata$study_group=="exploratory" & metadata$Sample_type=="Stool")
+ibsV4V5_names  = rownames(metadata[idx,])
+otu_stool_V4V5 = otu_stool[, ibsV4V5_names]
+lab            = as.factor(as.character(metadata[ibsV4V5_names,]$SSgroup))
+otu.denoized   = otu_stool_V4V5.denoized = noise.removal(prop.table(as.matrix(otu_stool_V4V5[,!is.na(lab)],2),2), percent=1)
+dd             = t(log10(otu.denoized+0.000001))
+lab            = lab[!is.na(lab)]
+levels(lab)    = c("1","1","1","-1")
+all.roc.dd[[2]]= list(dd=dd,lab=lab)
+```
+
+<!---
+- severe vs rest (without healthy control) at V4/V5
+-->
+
+
+```{r }
+# preprocessing
+ 
+idx            = which(metadata$study_group=="exploratory" & metadata$Sample_type=="Stool")
+ibsV4V5_names  = rownames(metadata[idx,])
+otu_stool_V4V5 = otu_stool[, ibsV4V5_names]
+
+lab            = as.factor(as.character(metadata[ibsV4V5_names,]$SSgroup))
+lab2           = as.factor(as.character(metadata[ibsV4V5_names,]$Health))
+otu.denoized   = otu_stool_V4V5.denoized = noise.removal(prop.table(as.matrix(otu_stool_V4V5[,!is.na(lab) & lab2=="patient"],2),2), percent=1)
+dd             = t(log10(otu.denoized+0.000001))
+lab            = lab[!is.na(lab) & lab2=="patient"]
+levels(lab)    = c("1","1","1","-1")
+all.roc.dd[[3]]= list(dd=dd,lab=lab)
+```
+
+
+```{r }
+# preprocessing at genus level
+ 
+idx            = which(metadata$study_group=="exploratory" & metadata$Sample_type=="Stool")
+ibsV4V5_names  = rownames(metadata[idx,])
+genus_stool_V4V5 = genus_stool[, ibsV4V5_names]
+
+lab            = as.factor(as.character(metadata[ibsV4V5_names,]$SSgroup))
+lab2           = as.factor(as.character(metadata[ibsV4V5_names,]$Health))
+genus.denoized   = genus_stool_V4V5.denoized = noise.removal(prop.table(as.matrix(genus_stool_V4V5[,!is.na(lab) & lab2=="patient"],2),2), percent=1)
+dd             = t(log10(genus.denoized+0.000001))
+lab            = lab[!is.na(lab) & lab2=="patient"]
+levels(lab)    = c("1","1","1","-1")
+all.roc.dd[[5]]= list(dd=dd,lab=lab)
+```
+
+
+
+
+
+
+
+- IBS-C vs rest at V4/V5
+
+```{r }
+# preprocessing
+idx            = which(metadata$study_group=="exploratory" & metadata$Sample_type=="Stool")
+ibsV4V5_names  = rownames(metadata[idx,])
+otu_stool_V4V5 = otu_stool[, ibsV4V5_names]
+lab            = as.factor(as.character(metadata[ibsV4V5_names,]$IBS_subtypes))
+otu.denoized   = otu_stool_V4V5.denoized = noise.removal(prop.table(as.matrix(otu_stool_V4V5[,!is.na(lab)],2),2), percent=1)
+dd             = t(log10(otu.denoized+0.000001))
+lab            = lab[!is.na(lab)]
+levels(lab)    = c("1","-1","1","1","1")
+all.roc.dd[[4]]= list(dd=dd,lab=lab)
+```
+
+
+
+
+All conditions was then analyzed with AUROC analysis...
+
+```{r all_roc_analyses, cache=TRUE}
+nfold=10
+nboot=10
+
+if(str_length(system.file("data", "all.roc.analyses.rda", package = "IBSMicrobiota")) == 0) {
+
+	
+	for (i in c(1,2,5)) {
+	
+		dd         = all.roc.dd[[i]]$dd
+		lab        = all.roc.dd[[i]]$lab
+		res        = logistic.CV.boot(data = dd, labels = lab, nfolds = 10, ty = 6,
+									  cost.try = c(100000, 10000,  1000, 100,  10,  1, 0.1,0.01,0.001),
+									  sparse = TRUE, nboot = 10, p.bar = FALSE)
+	
+		model.perf = model.performance(res)
+		tpr        = model.perf$tpr
+		fpr        = model.perf$fpr
+		AUC        = model.perf$AUC
+		w          = model.perf$features.w[-which(rownames(model.perf$features.w)=="Bias"),]
+	
+		#select important species from the model (80% weight of the model)
+		selected.species = names(w[order(w[,5]),4][cumsum(w[order(w[,5]),5]) > (1-0.80)]) 
+		features.tax     = tax[selected.species,]
+	
+		all.roc.analyses[[i]] = list(
+			 
+			 fpr.hci          = apply(fpr,1,function(x) {quantile(x,0.1)}), 
+			 tpr.hci          = apply(tpr,1,function(x) {quantile(x,0.9)}),
+			 fpr.med          = apply(fpr,1,median),
+			 tpr.med          = apply(tpr,1,median),
+			 fpr.lci          = apply(fpr,1,function(x) {quantile(x,0.9)}),
+			 tpr.lci          = apply(tpr,1,function(x) {quantile(x,0.1)}),
+			 model.perf       = model.perf,
+			 selected.species = selected.species,
+			 features.tax     = features.tax,
+			 w = w,
+			 AUC = AUC,
+			 res = res	 
+			 )
+	
+			 
+		class(all.roc.analyses[[i]]) = c("lasso_roc", "list")
+	
+	}
+	
+	#devtools::use_data(all.roc.analyses)
+
+} else {load(system.file("data", "all.roc.analyses.rda", package = "IBSMicrobiota"))}
+
+
+
+
+
+```
+
+
+```{r external_validation_function, include=FALSE}
+
+external_validation=function(res, dd, lab) {
+
+	nboot   = length(res)
+	ncv     = length(res[[1]]$model)
+	res.ext = vector( "list", nboot*ncv)
+	lab     = lab
+
+	xTrain = dd.ext = dd
+	xTrain = t(t(scale(xTrain, scale=FALSE))/(apply(xTrain,2,sd)+quantile(apply(xTrain,2,sd),0.1))) # add 10th sd
+	xTrain[,attr(na.omit(t(xTrain)), "na.action")] = 0
+	dd.ext = xTrain		
+			
+			
+			
+
+	for(i in 1:nboot){
+
+		res.tmp = lapply(res[[i]]$model ,function(x) {predict(x, dd.ext, prob=TRUE)})
+
+		for(j in 1:ncv){
+			res.ext[[((i-1)*10)+j]]$pred = data.frame(prediction    = res.tmp[[j]]$prediction,
+													  actual        = lab,
+													  probabilities = res.tmp[[j]]$probabilities[,1])
+		}
+
+	}
+
+
+
+	model.perf.ext = model.ext.validation(res.ext, nboot = 100)
+
+
+	return(model.perf.ext)
+
+}
+
+
+```
+
+...and was validated on biopsies set and the validation set.
+
+____________________________________________________________________________________________________
+
+
+```{r plot.external.validation, fig.show="hide", fig.cap="external validation of the model on biopsy and stool samples.", fig.height=8, fig.width=8}
+
+par(mfrow = c(3,3))
+
+AUC.df.results = NULL
+
+for(i in c(1,2)) {
+	plot.lasso_roc(all.roc.analyses[[i]], explore=FALSE, main=names(all.roc.analyses)[i]); abline(b=1, a=0, lty=3)
+
+	training.AUC = all.roc.analyses[[i]]$model.perf$AUC
+	training.nb  = length(training.AUC)
+	
+	tmp            = data.frame(AUC=training.AUC, type=rep("training",training.nb), experiment=rep(names(all.roc.analyses)[i],training.nb))
+	AUC.df.results = rbind(AUC.df.results,tmp)
+
+}
+
+for (i in c(1,2)) {
+
+
+# on biopsies
+res             = all.roc.analyses[[i]]$res
+idx             = which(metadata$study_group=="exploratory" & metadata$Sample_type=="Biopsy")
+ibsV4V5_names   = rownames(metadata[idx,])
+otu_biopsy_V4V5 = otu[, ibsV4V5_names]
+
+if(i %in% c(1:3)) {
+lab                  = as.factor(as.character(metadata[ibsV4V5_names,]$SSgroup))
+lab2                 = as.factor(as.character(metadata[ibsV4V5_names,]$Health))
+otu_biopsy_V4V5.norm = prop.table(as.matrix(otu_biopsy_V4V5[,!is.na(lab)],2),2)
+otu.denoized         = otu_biopsy_V4V5.norm[colnames(res[[1]]$model[[1]]$W)[-length(colnames(res[[1]]$model[[1]]$W))],]
+dd                   = t(log10(otu.denoized+0.000001))
+lab                  = lab[!is.na(lab)]
+levels(lab)          = c("1","1","1","-1") 
+
+} else {
+
+
+lab                  = as.factor(as.character(metadata[ibsV4V5_names,]$IBS_subtypes))
+lab2                 = as.factor(as.character(metadata[ibsV4V5_names,]$Health))
+otu_biopsy_V4V5.norm = prop.table(as.matrix(otu_biopsy_V4V5[,!is.na(lab)],2),2)
+otu.denoized         = otu_biopsy_V4V5.norm[colnames(res[[1]]$model[[1]]$W)[-length(colnames(res[[1]]$model[[1]]$W))],]
+dd                   = t(log10(otu.denoized+0.000001))
+lab                  = lab[!is.na(lab)]
+levels(lab)          = c("1","-1","1","1") 
+
+
+}
+
+
+
+
+dd.biopsy         = dd
+lab.biopsy        = lab
+model.perf.biopsy = external_validation(res, dd.biopsy, lab.biopsy)
+tpr               = model.perf.biopsy$tpr
+fpr               = model.perf.biopsy$fpr
+AUC               = model.perf.biopsy$AUC
+
+
+subtitle = paste("AUC:",median(AUC))
+plot(apply(fpr,1,median), apply(tpr, 1, median),main="ROC Curve\nValidation on Biopsies",ylab="True Positive Rate",xlab="False Positive Rate",sub=paste("AUC:",round(median(AUC),2)), type="n")
+lines(apply(fpr,1,function(x) {quantile(x,0.1)}), apply(tpr,1,function(x) {quantile(x,0.9)}), lty=2)
+lines(apply(fpr,1,median), apply(tpr,1,median), lwd=2)
+lines(apply(fpr,1,function(x) {quantile(x,0.9)}), apply(tpr,1,function(x) {quantile(x,0.1)}), lty=2)
+abline(b = 1, a = 0, lty = 3)
+
+
+
+
+biopsy.ext.AUC = AUC
+biopsy.ext.nb  = length(biopsy.ext.AUC)
+
+tmp            = data.frame(AUC=biopsy.ext.AUC,
+				            type=rep("validation_biopsies",biopsy.ext.nb),
+				            experiment=rep(names(all.roc.analyses)[i], biopsy.ext.nb))
+
+AUC.df.results = rbind(AUC.df.results,tmp)
+
+}
+
+for(i in c(1,2)) {
+# stool samples external validation
+res            = all.roc.analyses[[i]]$res
+idx            = which(metadata$study_group=="validation" & metadata$Sample_type=="Stool" )
+ibsV4V5_names  = rownames(metadata[idx,])
+otu_stool_V4V5 = otu_stool[, ibsV4V5_names]
+
+if(i %in% 1:3) {
+
+lab                 = as.factor(as.character(metadata[ibsV4V5_names,]$SSgroup))
+lab2                = as.factor(as.character(metadata[ibsV4V5_names,]$Health))
+otu_stool_V4V5.norm = prop.table(as.matrix(otu_stool_V4V5[,!is.na(lab)],2),2)
+otu.denoized        = otu_stool_V4V5.norm[colnames(res[[1]]$model[[1]]$W)[-length(colnames(res[[1]]$model[[1]]$W))],]
+dd                  = t(log10(otu.denoized+0.000001))
+lab                 = lab[!is.na(lab)]
+levels(lab)         = c("1","1","1","-1") # no remission patient!
+
+} else {
+
+
+lab                 = as.factor(as.character(metadata[ibsV4V5_names,]$IBS_subtypes))
+lab2                = as.factor(as.character(metadata[ibsV4V5_names,]$Health))
+otu_stool_V4V5.norm = prop.table(as.matrix(otu_stool_V4V5[,!is.na(lab)],2),2)
+otu.denoized        = otu_stool_V4V5.norm[colnames(res[[1]]$model[[1]]$W)[-length(colnames(res[[1]]$model[[1]]$W))],]
+dd                  = t(log10(otu.denoized+0.000001))
+lab                 = lab[!is.na(lab)]
+levels(lab)         = c("1","-1","1","1","1") 
+
+
+}
+
+
+
+
+dd.stool       = dd
+lab.stool      = lab
+model.perf.ext = external_validation(res, dd.stool, lab.stool)
+tpr            = model.perf.ext$tpr
+fpr            = model.perf.ext$fpr
+AUC            = model.perf.ext$AUC
+
+
+subtitle=paste("AUC:",median(AUC))
+plot(apply(fpr,1,median), apply(tpr, 1, median),main="ROC Curve\nValidation on Ext Stools",ylab="True Positive Rate",xlab="False Positive Rate",sub=paste("AUC:",round(median(AUC),2)), type="n")
+lines(apply(fpr,1,function(x) {quantile(x,0.1)}), apply(tpr,1,function(x) {quantile(x,0.9)}), lty=2)
+lines(apply(fpr,1,median), apply(tpr,1,median), lwd=2)
+lines(apply(fpr,1,function(x) {quantile(x,0.9)}), apply(tpr,1,function(x) {quantile(x,0.1)}), lty=2)
+abline(b=1, a=0, lty=3)
+
+
+stool.ext.AUC  = AUC
+stool.ext.nb   = length(stool.ext.AUC)
+tmp            = data.frame(AUC = stool.ext.AUC,
+							type       = rep("validation_stool",stool.ext.nb),
+							experiment = rep(names(all.roc.analyses)[i],stool.ext.nb))
+AUC.df.results = rbind(AUC.df.results,tmp)
+
+}
+
+
+tpr_model_fpr_20  = rev(all.roc.analyses[[2]]$tpr.med[all.roc.analyses[[2]]$fpr.med < 0.2])[1]
+tpr_biopsy_fpr_20 = rev(apply(model.perf.biopsy$tpr,1, median)[apply(model.perf.biopsy$fpr,1, median) < 0.2])[1]
+tpr_ext_fpr_20    = rev(apply(model.perf.ext$tpr,1, median)[apply(model.perf.ext$fpr,1, median) < 0.2])[1]
+
+
+
+pdf("../inst/figures/Tap_tpr_fpr_table.pdf", h=4,w=4)
+grid.arrange(
+	tableGrob(
+		data.frame(
+			                set= c("exploratory stool","validation biopsy","validation stool"),
+			 "tpr with fpr 20%"= round(c(tpr_model_fpr_20,tpr_biopsy_fpr_20,tpr_ext_fpr_20),3)*100, 
+		check.names=F)
+	)
+)
+
+dev.off()
+
+
+```
+<!---
+**Figure 6 (supp info): external validation of the model on biopsy and stool samples**
+-->
+____________________________________________________________________________________________________
+
+
+____________________________________________________________________________________________________
+
+
+```{r model.AUC.performance, fig.cap="Model AUC performance", fig.height=5, fig.width=8}
+
+
+
+
+levels(AUC.df.results$experiment) = c("Severe IBS patients vs rest", "IBS-C patients vs rest")
+
+idx = which(AUC.df.results$type == "validation_stool" & AUC.df.results$experiment == "IBS-C patients vs rest")
+
+AUC.df.results2 = AUC.df.results[ -idx,]
+AUC.df.results2$experiment = as.character(AUC.df.results2$experiment)
+
+ggplot(AUC.df.results2, aes(y=AUC, x=type)) + geom_boxplot() + 
+geom_hline(yintercept=0.5, col="red", linetype=2) + 
+facet_wrap(~experiment) + theme_bw() + xlab("") +
+scale_x_discrete(labels=c("exploratory\nstool set","biopsy set","validation\nstool set")) +
+theme(axis.text.x = element_text(angle = 90, vjust = 0, hjust=1))
+
+
+
+p19_AUC = ggplot(AUC.df.results2[which(AUC.df.results2$exp=="Severe IBS patients vs rest"),], aes(y=AUC, x=type)) + geom_boxplot() + 
+geom_hline(yintercept=0.5, col="red", linetype=2) + 
+#facet_wrap(~experiment) + 
+theme_bw() + xlab("") + coord_flip() +
+scale_x_discrete(labels=c("exploratory\nstool set","biopsy set","validation\nstool set")) #+
+#theme(axis.text.x = element_text(angle = 90, vjust = 0, hjust=1))
+
+
+
+
+```
+
+**Figure 6: AUC performance of classification models**.
+Classification models based on IBS severe vs rest (left panel) and IBS-C vs resr were computed.
+AUC from classification models derived from LASSO regression were pictured as function of dataset : 
+exploratory stool set, biopsy set and external validation stool set.
+There is no enough IBS-C sample to do a validation.
+Red dashed lines showed the AUC cut-off for random expectation.
+
+
+____________________________________________________________________________________________________
+
+OTUs complexity reduction by machine learning allowing modelisation of IBS severity and IBS-C.
+
+- For IBS severe: Validation on biopsies and external stool cohort (2nd batch) 
+- For IBC: not enough patients in IBSc in the 2nd batch. 
+
+Around ~90 OTUs (among ~2,900) was useful to model IBS severity.
+
+____________________________________________________________________________________________________
+
+
+```{r}
+
+
+pdf("../inst/figures/Tap_Figure_severe_signature.pdf", h=3, w=9)
+grid.arrange(p18_univ_test,p19_AUC, ncol=2)
+dev.off()
+
+
+
+Tap_Figure_severe_signature_cowplot = plot_grid(
+
+  p18_univ_test + background_grid(major ="none", minor="none"),
+  p19_AUC       + background_grid(major ="none", minor="none"),
+  
+  ncol=2, labels=LETTERS[1:2])
+  
+pdf("../inst/figures/Tap_Figure_severe_signature_cowplot.pdf", h=3, w=9)
+
+Tap_Figure_severe_signature_cowplot
+
+dev.off()
+
+
+```
+
+
+
+
+
+
+
+
+### Microbial OTUs based IBS severe signature associations with clinical parameters
+
+A PCA analysis using the 100 extracted OTUs and a multivariate analysis (Hill Smith based analysis) with mixed quantitatives and qualitatives clinical metadata were performed. 
+Both analysis (OTU based PCA and the Hill/Smith) were then combined using a co-inertia analysis to check associations between discrimatives OTUs and clinical parameters.
+
+
+<!---
+
+```{r Intersection_models, fig.cap="model species intersection between SevereVSrest and SevereVSMildonly", fig.height=7, fig.width=7, eval=FALSE}
+# venn(list("SevereIBS_VS_rest"=all.roc.analyses[[2]]$selected.species, "SevereIBS_VS_MildIBS"=all.roc.analyses[[3]]$selected.species, "Control_vs_IBS"=all.roc.analyses[[1]]$selected.species))
+```
+-->
+
+
+```{r prepare_signature_pca}
+idx                      =  which(metadata$study_group=="exploratory" & metadata$Sample_type=="Stool")
+idx                      = which(metadata$Sample_type=="Stool")
+ibsV4V5_names            = rownames(metadata[idx,])
+#metadata.select          = na.omit(metadata[ibsV4V5_names,c("SSgroup","Age","BMI","H2_group","CH4_group","Lactulose_clusters","IBS_subtypes","HAD.ANXIETY","HAD.DEPRES","BSF.Mean_Stoolform_total","BSF.Mean_Frequenc_StoolPerDay","transit.days")])
+#metadata.select          = na.omit(metadata[ibsV4V5_names,c("SSgroup","Age","BMI","H2_group","CH4_group","IBS_subtypes","HAD.ANXIETY","HAD.DEPRES","BSF.Mean_Stoolform_total","BSF.Mean_Frequenc_StoolPerDay","transit.days")])
+metadata.select          = na.omit(metadata[ibsV4V5_names,c("SSgroup","Age","BMI","H2","CH4","IBS_subtypes","HAD.ANXIETY","HAD.DEPRES","BSF.Mean_Stoolform_total","BSF.Mean_Frequenc_StoolPerDay","transit.days")])
+metadata.select2         = metadata[rownames(metadata.select),  ]
+#metadata.coa             = dudi.mix(metadata.select[,-c(1,2)], scannf=FALSE, nf=4)
+metadata.coa             = dudi.mix(metadata.select, scannf=FALSE, nf=4) # we challenge how this signature represented the severity aga../inst other parameters
+selected.species.summary = all.roc.analyses[[2]]$selected.species
+
+
+
+otu_stool_V4V5 = otu_stool[, rownames(metadata.select)]
+lab            = as.factor(metadata.select$SSgroup)
+otu.denoized   = otu_stool_V4V5.denoized = prop.table(as.matrix(otu_stool_V4V5[selected.species.summary,!is.na(lab)],2),2)
+dd             = t(log10(otu.denoized+0.000001))
+
+lab        = lab[!is.na(lab)]
+lab        = factor(as.character(lab), levels=c("control","mild","moderate","severe"))
+levels(lab)= c("control","mild","moderate","severe")
+
+otu.pca = dudi.pca(dd, scannf=F, nf=3)
+
+
+#check OTU difference between IBS-C and IBS-D
+
+Severe_IBSCvsIBSD_otu_test = 
+data.frame(metadata.select[,c(1,6)],dd)[which((metadata.select$IBS_subtypes=="IBS-C" | metadata.select$IBS_subtypes=="IBS-D") & metadata.select$SSgroup == "severe" ),] %>% 
+melt(id.vars=c("SSgroup","IBS_subtypes")) %>%
+group_by(SSgroup, variable) %>%
+do(w=wilcox.test(value~IBS_subtypes, data=., paired=F)) %>%
+summarise(variable, p.value = w$p.value) %>% mutate(q.value = p.adjust(p.value, method="fdr")) %>% as.data.frame
+
+
+
+Severe_IBSCvsIBSD_otu_median = 
+data.frame(metadata.select[,c(1,6)],dd)[which((metadata.select$IBS_subtypes=="IBS-C" | metadata.select$IBS_subtypes=="IBS-D") & metadata.select$SSgroup == "severe" ),] %>% 
+melt(id.vars=c("SSgroup","IBS_subtypes")) %>%
+group_by(SSgroup, IBS_subtypes, variable) %>%
+summarize(median=median(value)) %>%
+dcast(variable~SSgroup+IBS_subtypes)
+
+Severe_IBSCvsIBSD = 
+data.frame(Severe_IBSCvsIBSD_otu_median,Severe_IBSCvsIBSD_otu_test[,-1])
+
+
+```
+
+
+```{r species.selection.progression.gradient, fig.show="hide", fig.cap="IBS signature severity progression", fig.height=7, fig.width=5}
+boxplot(otu.pca$li[,2] ~ lab, col=rev(brewer.pal(4,"BrBG")), ylab="2nd principal component based on IBS microbial signature")
+
+pdf("../inst/figures/Tap_PCA_OTU_signatures_IBS_severity.pdf", h=5,w=5)
+boxplot(otu.pca$li[,2] ~ lab, col=rev(brewer.pal(4,"BrBG")), ylab="2nd principal component based on IBS microbial signature")
+dev.off()
+
+pca_SSScore = data.frame(otu.pca$li, SS=metadata[row.names(otu.pca$li),"IBS.Severity.Score"], SSgroup = lab)
+
+#plot(pca_SSScore[,1],  pca_SSScore$SS)
+
+
+```
+
+
+
+```{r , eval=FALSE}
+
+cor.test(pca_SSScore[,2], as.numeric(pca_SSScore$SSgroup), method="spearman")
+
+```
+<!---
+There is a significant link between PC2 and IBS severity gradient.
+*/
+-->
+
+```{r coinertia_analysis_severe_clinical}
+
+ibs.coi         = coinertia(otu.pca, metadata.coa, scannf=FALSE, nf=3)
+ibs_coi_eig     = round(ibs.coi$eig/ sum(ibs.coi$eig),3)*100
+microbiota_type = mixture(best_genus, assign=TRUE)
+microbiota_type = microbiota_type[names(microbiota_type) %in% row.names(metadata.select)]
+
+
+dd         = data.frame(metadata.select2, ibs.coi$lX, microbiota_type=as.character(microbiota_type))
+dd$SSgroup = factor(as.character(dd$SSgroup), levels=rev(c("control", "mild", "moderate", "severe")))
+levels(dd$SSgroup) = c("Severe","Moderate","Mild","Healthy")
+
+cor.test(dd$AxcX1, dd$richness, method="spearman")
+cor.test(dd$AxcX1, dd$CH4, method="spearman")
+cor.test(dd$AxcX1, dd$HAD.ANXIETY, method="spearman")
+cor.test(dd$AxcX1, dd$HAD.DEPRES, method="spearman")
+
+cor.test(dd$AxcX2, dd$transit.days, method="spearman")
+cor.test(dd$AxcX2, dd$BSF.Mean_Stoolform_total, method="spearman")
+
+
+p6_severe_coi = ggplot(dd, aes(x=AxcX1, y=AxcX2)) +
+     geom_point(aes(col=SSgroup, size=richness), alpha=0.8) + 
+     scale_colour_brewer(palette="BrBG", guide = guide_legend(title = "IBS-SS group" )) +
+     scale_size(range = c(2, 8), guide = guide_legend(title = "Microbial\nrichness" )) + 
+     xlab(paste("PC1",ibs_coi_eig[1],"%")) + ylab(paste("PC2",ibs_coi_eig[2],"%"))
+     
+     
+     
+#p6 = p6 + geom_segment(data=ibs.coi$li*4 , aes(x=0,y=0,xend=Axis1, yend=Axis2 ), alpha=0.8, arrow = arrow(length = unit(0.2, "cm"))) + geom_text(data=ibs.coi$li*4, aes(x=Axis1, y=Axis2 ), label=rownames(ibs.coi$li), alpha=0.8)
+
+
+p7_enterotypes_coi = ggplot(dd, aes(x=AxcX1, y=AxcX2)) +
+     geom_point(aes(col=microbiota_type, size=IBS.Severity.Score), alpha=0.8) + 
+     scale_colour_brewer(palette="Set1", guide = guide_legend(title = "Enterotypes" ), labels=c("1: Clostridiales","2: Bacteroides","3: Prevotella"  )) +
+     scale_size(range = c(2, 8),  guide = guide_legend(title = "IBS-SS Score" ) ) + 
+     xlab(paste("PC1",ibs_coi_eig[1],"%")) + ylab(paste("PC2",ibs_coi_eig[2],"%"))
+
+
+
+#p7 = p7 + geom_segment(data=ibs.coi$li*4 , aes(x=0,y=0,xend=Axis1, yend=Axis2 ), alpha=0.8, arrow = arrow(length = unit(0.2, "cm"))) + geom_text(data=ibs.coi$li*4, aes(x=Axis1, y=Axis2 ), label=rownames(ibs.coi$li), alpha=0.8)
+
+
+p8_methano_coi = ggplot(dd, aes(x=AxcX1, y=AxcX2)) + geom_point(aes(col=as.character(Methanogens_qPCR), size=CH4), alpha=0.8) +
+     scale_colour_brewer(palette="Set2" , guide = guide_legend(title = "Methanobacteriales" ), labels=c("undetected","presence")) +
+	 scale_size(range = c(3, 10),guide = guide_legend(title = "CH4 (ppm)" )) +
+	 xlab(paste("PC1",ibs_coi_eig[1],"%")) + ylab(paste("PC2",ibs_coi_eig[2],"%"))
+#p8 = p8 + geom_segment(data=ibs.coi$li*4 , aes(x=0,y=0,xend=Axis1, yend=Axis2 ), alpha=0.8, arrow = arrow(length = unit(0.2, "cm"))) + geom_text(data=ibs.coi$li*4, aes(x=Axis1, y=Axis2 ), label=rownames(ibs.coi$li), alpha=0.8)
+
+
+p9_HAD_coi = ggplot(dd, aes(x=AxcX1, y=AxcX2)) +
+     geom_point(aes(col=Lactulose_clusters, size=HAD.ANXIETY+HAD.DEPRES), alpha=0.8) +
+	 scale_colour_brewer(type="seq", palette="YlGnBu") + scale_size(range = c(3, 10)) +
+	 xlab(paste("PC1",ibs_coi_eig[1],"%")) + ylab(paste("PC2",ibs_coi_eig[2],"%"))
+	 
+dd.qual = melt(dd[,c("microbiota_type","Methanogens_qPCR","CH4_group","H2_group","Health","SSgroup","IBS_subtypes","AxcX1","AxcX2")] , id.vars=c("AxcX1","AxcX2"))
+
+
+p10 = ggplot(na.omit(dd.qual)) + geom_boxplot(aes(y=AxcX1, x=value)) + facet_wrap(~variable, scales="free_x", nrow=2)
+
+
+p11 = ggplot(dd, aes(x=AxcX1, y=AxcX2)) +
+     geom_point(aes(col=Lactulose_clusters, size=HAD.ANXIETY+HAD.DEPRES), alpha=0.8) +
+	 scale_colour_brewer(type="seq", palette="YlGnBu") + scale_size(range = c(3, 10)) +
+	 xlab(paste("PC1",ibs_coi_eig[1],"%")) + ylab(paste("PC2",ibs_coi_eig[2],"%"))
+
+
+
+
+PCloadings = ibs.coi$li[-1,]
+
+row.names(PCloadings) = c("Mild","Moderate","Severe","Age","BMI","H2",
+                          "CH4","IBS-C","IBS-D","IBS-M",
+                         "Healthy","Anxiety","Depress","BSF","Stool_day","OATT")
+
+
+
+p20_clinical_coi = ggplot(PCloadings, aes(x=Axis1, y=Axis2)) + geom_text(label=row.names(PCloadings), size=3, col="red") + geom_segment(aes(xend=Axis1, yend=Axis2, x=0, y=0), linetype=2, col="grey", arrow = arrow(length = unit(0.2, "cm"))) + theme_bw() + xlab("PC1 loading") + ylab("PC2 loading") + geom_hline(yintercept=0) + geom_vline(xintercept = 0)
+
+
+p12_subtypes_coi = ggplot(dd, aes(x=AxcX1, y=AxcX2)) + 
+      geom_point(aes(col=as.character(IBS_subtypes)), size=5, alpha=0.8) +
+      #scale_colour_brewer(palette="Set3" , guide = guide_legend(title = "IBS subtypes" ), labels=c("undetect","presence")) +
+      #scale_size(range = c(3, 10)) +
+      scale_color_manual(guide = guide_legend(title = "IBS subtypes"), labels = c("Healthy","IBS-C","IBS-D","IBS-M"), values = c(rev(brewer.pal(n=4, name="BrBG"))[1], dan_pal("dan1")(3))) +
+      xlab(paste("PC1",ibs_coi_eig[1],"%")) + ylab(paste("PC2",ibs_coi_eig[2],"%"))
+
+
+
+
+#p8 = p8 + geom_segment(data=ibs.coi$li*4 , aes(x=0,y=0,xend=Axis1, yend=Axis2 ), alpha=0.8, arrow = arrow(length = unit(0.2, "cm"))) + geom_text(data=ibs.coi$li*4, aes(x=Axis1, y=Axis2 ), label=rownames(ibs.coi$li), alpha=0.8)
+
+
+
+p_IBS_SSS_pc1 = ggplot(dd) + geom_density(aes(x=AxcX1, fill=SSgroup ), alpha=0.5) + 
+                scale_fill_brewer(palette="BrBG", guide = guide_legend(title = "IBS-SS group" )) + 
+                
+                xlab(paste("PC1",ibs_coi_eig[1],"%")) + theme_classic() #+
+                #guides(fill = guide_legend(override.aes = list(colour = NULL)))
+
+
+ 
+p_ETypes_pc1 = ggplot(dd) + geom_density(aes(x=AxcX1, fill=microbiota_type), alpha=0.5) + 
+               scale_fill_brewer(palette="Set1", guide = guide_legend(title = "Enterotypes" ), labels=c("1: Clostridiales","2: Bacteroides","3: Prevotella"  )) +
+               xlab(paste("PC1",ibs_coi_eig[1],"%")) + theme_classic() #+
+               #guides(fill = guide_legend(override.aes = list(colour = NULL)))
+
+
+p_Methane_pc1 = ggplot(dd, aes(x=AxcX1)) + geom_density(aes(fill=as.character(CH4_group)), alpha=0.5) +
+                scale_fill_brewer(palette="Set2" , guide = guide_legend(title = "exhaled CH4" ), labels=c("> 10ppm","< 10ppm")) +
+	 	            xlab(paste("PC1",ibs_coi_eig[1],"%")) + theme_classic()
+
+
+
+
+#p_Methane_pc1 = ggplot(dd, aes(x=AxcX1)) + geom_density(aes(fill=as.character(Methanogens_qPCR)), alpha=0.5) +
+#                scale_fill_brewer(palette="Set2" , guide = guide_legend(title = "exhaled CH4" ), labels=c("detected","undetected")) +
+#	 	            xlab(paste("PC1",ibs_coi_eig[1],"%")) + theme_classic()
+
+
+#p_subtypes_pc1 = ggplot(dd, aes(x=AxcX1)) + geom_density(aes(fill=IBS_subtypes), alpha=0.5) +
+#                 scale_fill_brewer(palette="Set2" , guide = guide_legend(title = "IBS subtypes" )) +
+#	 	             xlab(paste("PC1",ibs_coi_eig[1],"%")) + theme_classic()
+
+
+
+p_density = grid.arrange(
+                        p_IBS_SSS_pc1 + theme(legend.position=c(0.85,0.6)) ,
+                        p_ETypes_pc1  + theme(legend.position=c(0.85,0.6)) ,
+                        p_Methane_pc1 + theme(legend.position=c(0.85,0.6)) , 
+                        nrow=3)
+
+
+
+#p_Methane_pc1 = ggplot(dd, aes(x=AxcX2)) + geom_segment(aes(xend=AxcX2, y=CH4, yend=0)) +
+                #scale_fill_brewer(palette="Set2" , guide = guide_legend(title = "exhaled CH4" ), labels=c("< 10ppm","> 10ppm")) +
+#	 	            xlab(paste("PC1",ibs_coi_eig[1],"%")) + theme_classic()
+
+
+
+
+### phylognetic core
+
+
+
+otu_stool[1,which(metadata.enterotypes$Health=="control")]
+
+
+table(otu_stool[1,which(metadata.enterotypes$Health=="control")] > 0)[["TRUE"]]
+
+
+core.prev.healthy = apply(otu_stool[,which(metadata.enterotypes$Health=="control")], 1, function(x) {
+
+length(which(x > 0))/length(x)
+
+
+})
+
+
+
+core.prev.ibs.severe = apply(otu_stool[,which(metadata.enterotypes$SSgroup=="severe")], 1, function(x) {
+
+length(which(x > 0))/length(x)
+
+
+})
+
+
+dd_core_q50 = merge(
+  ibs.coi$co,
+  data.frame(
+    healthy.core=core.prev.healthy[row.names(ibs.coi$co)], 
+    IBS.severe.core=core.prev.ibs.severe[row.names(ibs.coi$co)],
+    q50=all.roc.analyses[[2]]$w[selected.species.summary, "q50"]), 
+   by="row.names")
+
+
+p_OTU_core_clinical = ggplot(dd_core_q50) + geom_point(aes(x=Comp1,y=Comp2, size=healthy.core-IBS.severe.core, color=q50), alpha=0.5) +
+theme_bw()+
+scale_size_continuous("OTUs prevalence\nenrichement\nin Healthy microbiota", labels=percent) +
+scale_color_gradient2("weight in\nthe model", low="red", mid="yellow", high="green")+
+xlab("PC1 loading")+ ylab("PC2 loading")
+
+
+
+#build the OTU signature table
+
+
+OTU_signature_tax_characteristics=
+merge(
+data.frame(dd_core_q50[,c(2,3,5:7)], IBSData$tax[dd_core_q50[,1],-c(1,7)]),
+Severe_IBSCvsIBSD, by.x="row.names", by.y="variable")
+
+names(OTU_signature_tax_characteristics) = 
+c("OTU","Coinertia Loadings PC1", 
+"Coinertia Loadings PC2", "Healthy prevalence","IBS severe prevalence",
+"Median weight","Phylum","Class","Order","Family","Genus",
+"Severe IBS-C mean proportion (log10)", "Severe IBS-D mean proportion (log10)",
+"Wilcoxon test p.value","Wilcoxon test q.value (fdr)")
+
+
+write.csv2(OTU_signature_tax_characteristics,
+file="inst/tables/TableS4_OTU_signature.csv")
+
+
+
+
+```
+
+____________________________________________________________________________________________________
+	 
+```{r otu.ibs.coinertia, fig.cap="IBS signature and metadata", fig.height=8, fig.width=15}
+grid.arrange(p6_severe_coi,p7_enterotypes_coi, p8_methano_coi, p12_subtypes_coi, p20_clinical_coi, nrow=3, ncol=2)
+
+
+
+```
+
+**Figure 8: Clinical and microbial metadata associations with IBS severe OTUs based signature.** Component detected from co-inertia analysis between OTU IBS severe signature and clinical metadata allowed to showed that severity gradient, microbial richness, enterotype stratification, CH4 exhaled, metanogens precence, lactulose challenge clusters and anxiety/depression were all linked with selected OTUs. H2 exhaled was not linked. 
+
+________
+
+```{r}
+
+pdf("../inst/figures/Tap_Figure_signature_metadata.pdf", h=14,w=14)
+
+grid.arrange(p6_severe_coi + theme_bw(),p7_enterotypes_coi+theme_bw(), p8_methano_coi+theme_bw(), p12_subtypes_coi+theme_bw(), p20_clinical_coi , p_OTU_core_clinical, nrow=3,ncol=2)
+
+
+
+dev.off()
+
+
+
+pdf("../inst/figures/Tap_Figure_signature_metadata_v2.pdf", h=16,w=14)
+
+grid.arrange(arrangeGrob(p6_severe_coi + theme_bw(),p7_enterotypes_coi+theme_bw(), p8_methano_coi+theme_bw(), p12_subtypes_coi+theme_bw(), ncol=2) , arrangeGrob(p20_clinical_coi, nullGrob(), ncol=2, widths=c(5,1)), nrow=2)
+
+
+dev.off()
+
+
+#cowplot
+
+Figure_signature_metadata = 
+
+plot_grid(
+
+  p6_severe_coi       + ggtitle("IBS severity and Microbial richness") + theme_cowplot(font_size = 12, font_family = "") + panel_border() ,
+  p7_enterotypes_coi  + ggtitle("IBS severity and Enterotypes") + theme_cowplot(font_size = 12) + panel_border() , 
+  p8_methano_coi      + ggtitle("gut Archea and Exhaled CH4") + theme_cowplot(font_size = 12) + panel_border() , 
+  p12_subtypes_coi    + ggtitle("IBS subtypes") + theme_cowplot(font_size = 12) + panel_border() , 
+  p20_clinical_coi    + ggtitle("Clinical metadata") + theme_cowplot(font_size = 12) + panel_border() , 
+  p_OTU_core_clinical + ggtitle("Gut microbial OTUs") + theme_cowplot(font_size = 12) + panel_border() , 
+
+  labels = LETTERS[1:6], ncol = 2, align = 'v', rel_widths = 1, label_size = 14)
+
+#h=12, w=12
+
+pdf("../inst/figures/Tap_Figure_signature_metadata_cowplot.pdf", h=12,w=12)
+
+Figure_signature_metadata
+
+dev.off()
+
+
+
+
+
+#Figure_signature_metadata = 
+
+#plot_grid(
+
+#  p6_severe_coi       + ggtitle("IBS severity and Microbial richness") + theme_classic() + theme(text = element_text(size = 12))+ panel_border() ,
+#  p7_enterotypes_coi  + ggtitle("IBS severity and Enterotypes") + theme_classic() + theme(text = element_text(size = 12))+ panel_border() , 
+#  p8_methano_coi      + ggtitle("gut Archea and Exhaled CH4") + theme_classic() + theme(text = element_text(size = 12))+ panel_border() , 
+#  p12_subtypes_coi    + ggtitle("IBS subtypes") + theme_classic() + theme(text = element_text(size = 12))+ panel_border() , 
+#  p20_clinical_coi    + ggtitle("Clinical metadata") + theme_classic() + theme(text = element_text(size = 12))+ panel_border() , 
+#  p_OTU_core_clinical + ggtitle("Gut microbial OTUs") + theme_classic() + theme(text = element_text(size = 12))+ panel_border() , 
+
+#  labels = LETTERS[1:6], ncol = 2, align = 'v', rel_widths = 1, label_size = 14)
+
+
+
+
+
+
+#Figure_signature_metadata = 
+
+#plot_grid(
+
+#  p20_clinical_coi    + ggtitle("Clinical metadata") + theme_classic() + theme(text = element_text(size = 12), legend.margin = grid::unit(0.1, 
+#                "cm"), legend.key.size = grid::unit(1, "lines"))+ panel_border() ,
+  
+#  p_OTU_core_clinical + ggtitle("Gut microbial OTUs") + theme_classic() + theme(text = element_text(size = 12), legend.margin = grid::unit(0.1, 
+#                "cm"), legend.key.size = grid::unit(1, "lines"))+ panel_border() , 
+  
+#  p6_severe_coi       + ggtitle("IBS severity and Microbial richness") + theme_classic() + theme(text = element_text(size = 12), legend.margin = grid::unit(0.1, 
+#                "cm"), legend.key.size = grid::unit(1, "lines"))+ panel_border() ,
+  
+ 
+#  p8_methano_coi      + ggtitle("gut Archea and Exhaled CH4") + theme_classic() + theme(text = element_text(size = 12))+ panel_border() , 
+  
+#  p12_subtypes_coi    + ggtitle("IBS subtypes") + theme_classic() + theme(text = element_text(size = 12))+ panel_border() , 
+   
+#   p7_enterotypes_coi  + ggtitle("IBS severity and Enterotypes") + theme_classic() + theme(text = element_text(size = 12))+ panel_border() , 
+
+#  labels = LETTERS[1:6], ncol = 2, align = 'v', rel_widths = 1, label_size = 14)
+
+
+
+
+Figure_signature_metadata = 
+
+plot_grid(
+  
+  p20_clinical_coi    + ggtitle("Clinical metadata") + theme_cowplot(font_size = 12) + panel_border() , 
+  
+  p_OTU_core_clinical + ggtitle("Gut microbial OTUs") + theme_cowplot(font_size = 12) + panel_border() , 
+
+  p6_severe_coi       + ggtitle("IBS severity and Microbial richness") + theme_cowplot(font_size = 12, font_family = "") + panel_border() ,
+  
+  
+  
+  p8_methano_coi      + ggtitle("gut Archea and Exhaled CH4") + theme_cowplot(font_size = 12) + panel_border() , 
+  
+  p12_subtypes_coi    + ggtitle("IBS subtypes") + theme_cowplot(font_size = 12) + panel_border() , 
+  
+  p7_enterotypes_coi  + ggtitle("IBS severity and Enterotypes") + theme_cowplot(font_size = 12) + panel_border() , 
+
+  labels = LETTERS[1:6], ncol = 2, align = 'v', rel_widths = 1, label_size = 14)
+
+
+
+
+
+
+pdf("../inst/figures/Tap_Figure_signature_metadata_cowplot_FINAL.pdf", h=12,w=12)
+
+Figure_signature_metadata
+
+dev.off()
+
+
+
+
+
+
+
+```
+
+
+```{r coinertia_spearman_corr}
+
+
+corr_res = cor(metadata.select[,-c(1,6)], ibs.coi$lX[1:2], method="pearson")
+
+
+pvalues1 = pvalues2 = NULL
+
+for( i in names(metadata.select[,-c(1,6)])) {
+	
+pvalues1 = c(pvalues1,cor.test(ibs.coi$lX[,1], metadata.select[,i])$p.value)
+	
+	
+pvalues2 = c(pvalues2,cor.test(ibs.coi$lX[,2], metadata.select[,i])$p.value)
+	
+}	
+
+coinertia_spearman_corr_res= data.frame(
+"PC1 correlation"=round(corr_res[,1],2), 
+"PC1 p.values"=round(pvalues1,3), 
+"PC2 correlation"=round(corr_res[,2],2), 
+"PC2 p.values"=round(pvalues2,3), 
+check.names=F)
+
+
+knitr::kable(coinertia_spearman_corr_res)
+
+```
+
+
+____________________________________________________________________________________________
+
+
+
+Combining clinical metadata and discriminative OTUs modelled for IBS severity allowed us to find significant associations between microbial richness, enterotypes, CH4 exhaled, 
+presence of metanogens, HAD anxiety/depression and IBS severity. 
+No associations were found with Age, BMI and H2 exhaled.
+
+
+<!---
+#____________________________________________________________________________________________________
+	 
+#```{r otu.ibs.coinertia_suppinfo, fig.cap="IBS signature and metadata", fig.height=8, fig.width=15}
+#p10 + ylab("PC1 from co-inertia analysis")
+
+
+#```
+
+#**Figure 8 (suppl info): Clinical and microbial metadata associations with IBS severe OTUs based signature.**
+
+#____________________________________________________________________________________________________
+
+
+#The first component from the co-inertia analysis was enough to explain all associations.
+
+#> TO DO: figure polishing
+
+
+
+
+
+#```{r, eval=FALSE }
+#tax.select = gsub("g__","",gsub("o__","",paste(tax[selected.species.summary,4], tax[selected.species.summary,6])))
+
+#p10 = ggplot(data.frame(ibs.coi$co, tax= tax.select), aes(x=Comp1, y=Comp2)) +
+#      geom_text(aes(label=tax), size=4) + theme_bw()
+	  
+#p11 = ggplot(data=ibs.coi$li , aes(x=0,y=0,xend=Axis1, yend=Axis2 )) +
+#	  geom_segment(alpha=0.8, arrow = arrow(length = unit(0.2, "cm"))) +
+#	  geom_text(data=ibs.coi$li, aes(x=Axis1, y=Axis2 ), label=rownames(ibs.coi$li), alpha=0.8) + theme_bw()
+#```
+
+
+#```{r otu.ibs.coinertia.score, fig.show="hide", fig.cap="IBS signature and metadata (score)", fig.height=11, fig.width=8, eval=FALSE}
+#grid.arrange(p10,p11, ncol=1)
+#```
+-->
+
+<!---
+
+#### work on detected OTU
+
+-->
+
+```{r, eval=FALSE}
+d2 = prop.table(table(otu.denoized["OTU_419",]>0, dd$SSgroup))
+
+
+```
+
+<!---
+
+### Taxonomic characterization of the microbial signature for IBS severity
+-->
+<!---
+#```{r OTU_tax_signature_compare, fig.cap="Number of OTU associated to IBS severity change in proportions compare to the whole set", h=4, w=12}
+
+
+
+#phylum_global         = as.data.frame(prop.table(table(tax[,"phylum"])))
+#phylum_global$ymax    = cumsum(phylum_global$Freq)
+#phylum_global$ymin    = c(0, head(phylum_global$ymax, n=-1))
+#phylum_signature      = as.data.frame(prop.table(table(tax[row.names(ibs.coi$co),"phylum"])))
+#phylum_signature$ymax = cumsum(phylum_signature$Freq)
+#phylum_signature$ymin = c(0, head(phylum_signature$ymax, n=-1))
+
+#genus_global          = as.data.frame(prop.table(table(tax[,"genus"])))
+#genus_global$ymax     = cumsum(genus_global$Freq)
+#genus_global$ymin     = c(0, head(genus_global$ymax, n=-1))
+#genus_signature       = as.data.frame(prop.table(table(tax[row.names(ibs.coi$co),"genus"])))
+#genus_signature$ymax  = cumsum(genus_signature$Freq)
+#genus_signature$ymin  = c(0, head(genus_signature$ymax, n=-1))
+
+
+#global = tax %>% group_by(phylum,family,genus) %>% summarise(count = n()) %>% arrange(phylum, desc(count))
+
+#global$freq =(global$count)/sum(global$count)
+#global$ymax = cumsum(global$freq)
+#global$ymin = c(0, head(global$ymax, n=-1))
+
+
+#signature = tax[row.names(ibs.coi$co),] %>% group_by(phylum,family,genus) %>% summarise(count = n()) %>% arrange(phylum, desc(count))
+#signature$freq=(signature$count)/sum(signature$count)
+#signature$ymax = cumsum(signature$freq)
+#signature$ymin = c(0, head(signature$ymax, n=-1))
+
+
+
+#phylum_signature = data.frame(phylum_signature, delta = phylum_signature$Freq - phylum_global$Freq)
+#genus_signature  = data.frame(genus_signature,  delta = genus_signature$Freq  - genus_global$Freq)
+
+
+
+#p21 = ggplot(phylum_signature[which(abs(phylum_signature$delta)>0.01),]) + 
+#geom_bar(aes(x=Var1, y=delta, fill= delta>0), stat="identity") + coord_flip() + 
+#scale_y_continuous(labels = percent) + theme_bw() + 
+#scale_fill_discrete("Taxa", labels=c("depletion","enrichment")) + 
+#xlab("") + ylab("Number of OTU assigned change\nin proportions by phylum") +  guides(fill=FALSE)
+
+
+
+#p22 = ggplot(genus_signature[which(abs(genus_signature$delta)>0.01),]) + 
+#geom_bar(aes(x=Var1, y=delta, fill= delta>0), stat="identity") + coord_flip() +
+#scale_y_continuous(labels = percent) + theme_bw() + 
+#scale_fill_discrete("Taxa", labels=c("depletion","enrichment")) + 
+#xlab("") + ylab("Number of OTU assigned change\nin proportions by genus")
+
+
+#grid.arrange(p21,p22, ncol=2, widths=c(0.75,1))
+
+
+#````
+
+#```{r}
+
+#pdf("../inst/figures/Tap_Figure_otu_tax_signature.pdf", h=4, w=12)
+#grid.arrange(p21,p22, ncol=2, widths=c(0.8,1))
+#dev.off()
+
+
+#```
+
+
+#```{r OTU_tax_signature_weight, fig.cap="OTU tax signature weight", h=4, w=12}
+
+#q50_df = data.frame(q50 = all.roc.analyses[[2]]$w[all.roc.analyses[[2]]$selected.species, "q50" ], tax[all.roc.analyses[[2]]$selected.species,])
+
+
+#q50_df_melt = melt(q50_df, id.vars="q50")
+
+#ggplot(q50_df_melt[q50_df_melt$variable=="genus",]) + geom_point(aes(y=q50,x=value))  + coord_flip() #+ facet_wrap(~variable, scale="free_x") + coord_flip()
+
+#ggplot(q50_df_melt[q50_df_melt$variable=="phylum",]) + geom_point(aes(y=q50,x=value))  + coord_flip() #+ facet_wrap(~variable, scale="free_x") + coord_flip()
+
+#ggplot(q50_df_melt[q50_df_melt$variable=="family",]) + geom_point(aes(y=q50,x=value))  + coord_flip() #+ facet_wrap(~variable, scale="free_x") + coord_flip()
+
+
+#chisq.test(table(q50_df_melt[q50_df_melt$variable=="family",]$sign, q50_df_melt[q50_df_melt$variable=="family",]$value)[,-1])
+
+
+#chisq.test(table(q50_df_melt[q50_df_melt$variable=="phylum",]$sign, q50_df_melt[q50_df_melt$variable=="phylum",]$value)[,-1])
+
+#chisq.test(table(q50_df_melt[q50_df_melt$variable=="genus",]$sign, q50_df_melt[q50_df_melt$variable=="genus",]$value))
+
+
+#chisq.test(table(q50_df_melt$sign, q50_df_melt$value))
+
+#ggplot(q50_df_melt) + geom_bar(aes(x=value, fill=sign)) + coord_flip() + facet_wrap(~variable, scale="free")
+
+#ggplot(q50_df_melt) + geom_bar(aes(x=value, fill=sign)) + facet_wrap(~variable, scale="free")
+
+#```
+
+-->
+
+
+
+
+
+
+
+
+
+
+
+### Key messages and next steps
+
+
+KEY MESSAGES
+
+- A global ecological shift was not detected between IBS patients and Healthy control. 
+Lower microbial richness was detected only in mild IBS patient biopsy. 
+Enterotypes stratification did not show different distribution according severity and subtypes
+
+- Microbial OTUs based univariates statistics showed promising signal with IBS severe patient and IBS-C patients.
+Nevertheless, this analysis might be subjected to random noise and OTU could be significant just by chance as demontrated. 
+
+- Microbial difference in stool was a good proxy to biospy as both paired samples covariates together 
+although there is significant difference even at phylum levels.
+
+
+- Machine learning helped to reduce complexity of dataset selecting ~3% OTUs
+useful to explore relationship between severity and microbiota. Those OTUs are validated in biopsies and in external stool dataset.
+
+
+- OTUs based IBS severe signature was linked to CH4 exhaled, presence of Metanogens, 
+enterotypes stratification, richness, lactulose clusters challenge and anxiety/depression.
+
+
+DONE STEPS (for the IBS severity 16S article):
+
+- Figures polishing (notably combing figure into multi panel figures) = DONE
+- OTUs IBS signature descriptions = DONE
+- other clinical metadata comparisons = DONE
+- alpha-diversity from enterotyping for sup info. = DONE
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

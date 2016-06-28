@@ -1,0 +1,167 @@
+---
+title: "IBS diet analysis with severity symtoms"
+author: "Julien Tap"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{IBSDiet}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+
+
+
+```{r global_options, include=FALSE}
+library(knitr)
+opts_chunk$set(fig.width=12, fig.height=8, warning=FALSE, message=FALSE, 
+echo=FALSE, dev=c("png", "pdf"), fig.cap=TRUE, cache=TRUE)
+
+```
+
+
+```{r load, comment=NA, include=FALSE}
+library(ggplot2)
+library(reshape2)
+library(RColorBrewer)
+library(IBSMicrobiota)
+library(dplyr)
+library(magrittr)
+```
+
+
+
+First we load IBS diet, OTU and clinical data and merge them
+
+
+```{r load_data}
+
+data(IBSData)
+data(diet)
+data(otuseverity)
+
+metadata = IBSData$metadata
+idx.v4 = which( metadata$Visit=="V4" & metadata$Sample_type =="Stool" ) 
+# we selected only stool sample baseline = visit V4
+metadata = metadata[idx.v4,]
+
+otuseverity_abund    = prop.table(as.matrix(IBSData$otu),2)[otuseverity,rownames(metadata)]
+tax                  = IBSData$tax
+
+diet_variable = c("kcal","PROT%","FAT%","CARB%","Total FODMAPs")
+
+diet_metadata = 
+merge(diet[,diet_variable], metadata, by.x="row.names", by.y= "Patient_ID", all.x=TRUE) 
+
+diet_metadata_otu = 
+merge(diet_metadata, t(otuseverity_abund), by.x="Sample_ID", by.y="row.names", all.x=TRUE)
+
+table(diet_metadata_otu$Health)
+
+diet_metadata_otu = diet_metadata_otu[, c("Age","Gender","BMI",diet_variable,"IBS.Severity.Score","SSgroup",rownames(otuseverity_abund))]
+
+
+
+```
+
+Second, we compute pairwise wilcoxon test between diet and health status
+
+
+```{r correlation_analysis_diet_SSgroup,fig.width=11, fig.height=5 }
+
+
+diet_SSgroup_melt = na.omit(melt(diet_metadata_otu[, c(diet_variable,"SSgroup")], id.vars="SSgroup"))
+
+levels(diet_SSgroup_melt$variable) = c("energy intake (kcal)", "Protein (%)", "Fat (%)", "Carb. (%)", "Total FODMAPs (g)")
+
+diet_vs_SSgroup_plot = 
+ggplot(diet_SSgroup_melt) +  geom_boxplot(aes(x=SSgroup,y=value, fill=SSgroup)) + 
+scale_fill_manual("Health status", values=rev(brewer.pal(n=4, name="BrBG"))) +
+facet_wrap(~variable, scale="free") + 
+ylab("") + xlab("")
+
+
+pdf("/home/tapju/storage/Dropbox/Danone/IBSMicrobiota/inst/figures/Tap_diet_vs_SSgroup_plot.pdf", w=11, h=5)
+diet_vs_SSgroup_plot 
+dev.off()
+
+diet_vs_SSgroup_plot 
+
+
+result_p=NULL
+for(i in levels(diet_SSgroup_melt$variable)) {
+	idx = which(diet_SSgroup_melt$variable==i)
+	p   = pairwise.wilcox.test(diet_SSgroup_melt$value[idx], diet_SSgroup_melt$SSgroup[idx], p.adjust="fdr")$p.value
+	p   = as.vector(p)
+	
+	result_p = rbind(result_p,p)
+}
+
+result_p = as.data.frame(t(na.omit(t(result_p))))
+
+colnames(result_p)  = c("control vs mild","control vs moderate","control vs severe", "mild vs moderate","mild vs severe","moderate vs severe")
+rownames(result_p)  = levels(diet_SSgroup_melt$variable)
+
+result_p #non significant expect for Protein % between mild,control vs moderate 
+
+
+```
+
+third, we computed the coinertia analysis between diet and OTUs (n=90) from the microbial signature for IBS severity. 
+RV coeficient and Monte-carlo test was used to test how diet and those OTUs were related
+
+
+```{r coinertia_analysis_diet_OTU}
+
+
+diet_otu = na.omit(diet_metadata_otu[, c(diet_variable, rownames(otuseverity_abund))])
+
+diet.pca = dudi.pca(diet_otu[,diet_variable], scannf=F, nf=3)
+otu.pca  = dudi.pca(log10(diet_otu[,rownames(otuseverity_abund)] + 10^-5), scannf=F, nf=3)
+
+diet_otu_coi = coinertia(diet.pca,otu.pca, scannf=F, nf=3)
+
+randtest(diet_otu_coi) #non_significant
+
+```
+
+
+```{r build_table_summary}
+
+
+diet_summary = 
+diet_metadata_otu[, c(3,4,5,6,7,23)] %>% melt(., id.vars="SSgroup") %>% 
+group_by(SSgroup,variable) %>% 
+summarize(median=median(round(value,2)), interquartile.inf=round(quantile(value, 0.25),2), interquartile.sup=round(quantile(value, 0.75),2)) %>%
+as.data.frame %>% na.omit #%>% dcast(SSgroup~variable) %>% as.data.frame
+
+
+diet_summary 
+
+#write.csv2(diet_summary, file="inst/tables/TableS2_diet_summary.csv")
+
+diet_summary =
+dcast(
+data.frame(diet_summary[1:2], v=paste0(diet_summary$median, " (", diet_summary$interquartile.inf, " - ", diet_summary$interquartile.sup,")"))
+
+, SSgroup~variable, value.var="v")
+
+
+write.csv2(diet_summary, file="inst/tables/TableS2_diet_summary.csv")
+
+
+
+```
+
+
+
+## Conclusion
+
+Diet was not associated with symptoms severity group except Protein intake 
+which found to be different between control/mild vs moderate.
+Diet was not associated with microbial signature OTU for IBS severity.
+
+
+
+#render("vignettes/IBSDiet.Rmd", output_dir="inst/doc/")
+

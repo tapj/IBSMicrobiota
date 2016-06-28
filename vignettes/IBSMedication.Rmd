@@ -1,0 +1,136 @@
+---
+title: "IBS diet analysis with severity symtoms"
+author: "Julien Tap"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{IBSMedication}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+
+
+
+```{r global_options, include=FALSE}
+library(knitr)
+opts_chunk$set(fig.width=12, fig.height=8, warning=FALSE, message=FALSE, 
+echo=FALSE, dev=c("png", "pdf"), fig.cap=TRUE, cache=TRUE)
+
+```
+
+
+```{r load, comment=NA, include=FALSE}
+library(ggplot2)
+library(reshape2)
+library(RColorBrewer)
+library(IBSMicrobiota)
+```
+
+
+```{r load_data}
+
+data(IBSData)
+data(medication)
+data(otuseverity)
+
+
+metadata = IBSData$metadata
+idx.v4 = which( metadata$Visit=="V4" & metadata$Sample_type =="Stool" ) 
+# we selected only stool sample baseline = visit V4
+metadata = metadata[idx.v4,]
+
+otuseverity_abund    = prop.table(as.matrix(IBSData$otu),2)[otuseverity,rownames(metadata)]
+
+metadata_medication = merge(medication, metadata[,c("Patient_ID","Sample_ID","Health","SSgroup")], by.x="row.names", by.y="Patient_ID", all.x=TRUE)
+metadata_medication = na.omit(metadata_medication)
+
+otu_medication = na.omit(merge(t(otuseverity_abund), metadata_medication, by.x="row.names", by.y="Sample_ID", all.y=TRUE))
+
+otu_medication[,"Laxative / Bulking agent"] = as.factor(otu_medication[,"Laxative / Bulking agent"])
+otu_medication[, "PPI / Acid suppression"]  = as.factor(otu_medication[,"PPI / Acid suppression"])
+otu_medication[,"Antidiarrhoeals"] = as.factor(otu_medication[,"Antidiarrhoeals"])
+otu_medication[,"Antidepressants"] = as.factor(otu_medication[,"Antidepressants"])
+
+
+ 
+
+```
+
+
+```{r chi_square_statistic}
+
+p = NULL
+
+medication_count = NULL
+
+for(i in colnames(medication)) {
+
+
+tb = table(metadata_medication[,i], metadata_medication$SSgroup)
+
+df = data.frame(tb, medication=i)
+
+p = c(p,chisq.test(tb)$p.value)
+
+medication_count = rbind(medication_count,df)
+
+}
+
+p = round(p.adjust(p, "fdr"), 2)
+
+levels(medication_count$medication) =paste(levels(medication_count$medication),"\n(p=", p,")", sep="")
+
+
+```
+
+
+```{r medication_count_plot, fig.width=7, fig.height=7}
+
+
+ggplot(medication_count) +  
+geom_bar(aes(x=Var2, y=Freq, fill=Var1), col="black", stat = "identity") + 
+facet_wrap(~medication) + theme_bw() + xlab("IBS symptoms severity") +  ylab("Number of subjects") +
+scale_fill_manual("Medication\nintake", values=c("white","grey"), labels=c("no", "yes"))
+
+
+```
+
+
+
+```{r coinertia_analysis_medication_OTU}
+
+
+
+medication.acm = dudi.acm(otu_medication[,colnames(medication)], scannf=F, nf=3)
+otu.pca  = dudi.pca(log10(otu_medication[,rownames(otuseverity_abund)] + 10^-5), scannf=F, nf=3)
+
+medication_otu_coi = coinertia(medication.acm ,otu.pca, scannf=F, nf=3)
+
+randtest(medication_otu_coi) #non_significant
+
+
+#rmarkdown::render("vignettes/IBSMedication.Rmd", output_dir="inst/doc/")
+
+
+```
+
+
+
+```{r table_medication_summary}
+
+#otu_medication[93:98] %>% melt(., id.vars=c("SSgroup", "Health")) %>% 
+#group_by(SSgroup,Health,variable) %>% summarize(n = sum(as.numeric(value))) %>%.[,c(1,3,4)] %>% as.data.frame %>%
+#dcast(SSgroup~variable)
+
+medication_summary=
+medication_count %>% dcast(medication~Var2+Var1, value.var="Freq")
+
+write.csv2(medication_summary, file="inst/tables/TableS2_medication_summary.csv")
+
+
+```
+
+
+
+
