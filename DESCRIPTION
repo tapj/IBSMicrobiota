@@ -1,8 +1,8 @@
 Package: IBSMicrobiota
-Title: What the package does (short line)
-Version: 0.2
-Authors@R: "First Last <first.last@example.com> [aut, cre]"
-Description: What the package does (paragraph)
+Title: Tap, Derrien et al article R source code.
+Version: 0.2.1
+Authors@R: "Julien Tap <julien.tap@danone.com> [aut, cre]"
+Description: This R package embbebed the source code used for Tap, Derrien et al study. Mardown document as as compiled HTML files could be browse as vignettes.
 Depends: R (>= 3.0.2)
 License: GPL-3
 LazyData: true

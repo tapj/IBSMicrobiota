@@ -990,7 +990,35 @@ scale_fill_manual("", labels = c("Healthy","Mild","Moderate","Severe"),
                                 values = c(rev(brewer.pal(n=4, name="BrBG")) ))
 
 
-# 5) facet_grid severity~subtypes, x=methano, fill=enterotypes
+
+# 5) CH4 vs subtypes
+
+p_CH4_severity = ggplot(na.omit(metadata.enterotypes[,c(14,21)])) + 
+geom_violin(aes(x=as.character(IBS_subtypes), y=CH4, fill=as.character(IBS_subtypes))) +
+geom_boxplot(width=0.1, position=position_dodge(0.9), aes(fill=NULL, x=as.character(IBS_subtypes), y=CH4)) +
+xlab("IBS subtypes")+
+ylab("exhaled CH4 (ppm)") +
+scale_fill_manual("", labels = c("Healthy","IBS-C","IBS-D","IBS-M"), 
+                                values = c(rev(brewer.pal(n=4, name="BrBG"))[1], dan_pal("dan1")(3))) + guides(fill=FALSE)
+
+
+
+# 6) CH4 vs severity
+
+p_CH4_subtypes = ggplot(na.omit(metadata.enterotypes[,c(14,18)])) + 
+geom_violin(aes(x=as.character(SSgroup), y=CH4, fill=as.character(SSgroup))) +
+geom_boxplot(width=0.1, position=position_dodge(0.9), aes(fill=NULL, x=as.character(SSgroup), y=CH4)) +
+xlab("IBS severity group")+
+ylab("exhaled CH4 (ppm)") +
+scale_x_discrete(labels = c("Healthy","Mild","Moderate","Severe")) +
+scale_fill_manual("", labels = c("Healthy","Mild","Moderate","Severe"), 
+                                values = c(rev(brewer.pal(n=4, name="BrBG")) )) + guides(fill=FALSE)
+
+
+
+
+
+# 7) facet_grid severity~subtypes, x=methano, fill=enterotypes
 
 # ggplot(na.omit(metadata.enterotypes[,c(5,18,21,28)])) + geom_bar(aes(fill=as.character(Methanogens_qPCR), x=as.character(enterotypes)), position="dodge")  + facet_grid(IBS_subtypes~SSgroup)
 
@@ -1115,12 +1143,16 @@ plot_grid(
   p_ch4_methano+theme_bw(),
   p_methano_enterotype+theme_bw()+theme(legend.position=c(0.8,0.8)), 
   p_methano_subtypes+theme_bw()+theme(legend.position=c(0.8,0.3)), 
-  p_methano_severity+theme_bw()+theme(legend.position=c(0.8,0.3)), ncol=2, labels=LETTERS[1:4] ) 
+  p_methano_severity+theme_bw()+theme(legend.position=c(0.8,0.3)), 
+  p_CH4_severity+theme_bw(),
+  p_CH4_subtypes+theme_bw(),
+      
+  ncol=2, labels=LETTERS[1:6] ) 
 
   
 
 
-pdf("../inst/figures/Tap_FigureSupp_methano_cowplot.pdf", h=7, w=10)
+pdf("../inst/figures/Tap_FigureSupp_methano_cowplot_new.pdf", h=10, w=10)
 Tap_FigureSupp_methano_cowplot
 dev.off()
 
